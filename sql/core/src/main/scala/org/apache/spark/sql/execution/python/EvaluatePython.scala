@@ -31,12 +31,13 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, ArrayData, GenericArrayData, MapData}
 import org.apache.spark.sql.types._
-import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.unsafe.types.{UTF8String, VariantVal}
 
 object EvaluatePython {
 
   def needConversionInPython(dt: DataType): Boolean = dt match {
-    case DateType | TimestampType | TimestampNTZType | _: DayTimeIntervalType => true
+    case DateType | TimestampType | TimestampNTZType | VariantType | _: DayTimeIntervalType
+         | _: TimeType => true
     case _: StructType => true
     case _: UserDefinedType[_] => true
     case ArrayType(elementType, _) => needConversionInPython(elementType)
@@ -78,7 +79,7 @@ object EvaluatePython {
 
     case (d: Decimal, _) => d.toJavaBigDecimal
 
-    case (s: UTF8String, StringType) => s.toString
+    case (s: UTF8String, _: StringType) => s.toString
 
     case (other, _) => other
   }
@@ -138,7 +139,7 @@ object EvaluatePython {
       case c: Int => c
     }
 
-    case TimestampType | TimestampNTZType | _: DayTimeIntervalType => (obj: Any) =>
+    case TimestampType | TimestampNTZType | _: DayTimeIntervalType | _: TimeType => (obj: Any) =>
       nullSafeConvert(obj) {
         case c: Long => c
         // Py4J serializes values between MIN_INT and MAX_INT as Ints, not Longs
@@ -200,6 +201,13 @@ object EvaluatePython {
       }
 
     case udt: UserDefinedType[_] => makeFromJava(udt.sqlType)
+
+    case VariantType => (obj: Any) => nullSafeConvert(obj) {
+      case s: java.util.HashMap[_, _] =>
+        new VariantVal(
+          s.get("value").asInstanceOf[Array[Byte]], s.get("metadata").asInstanceOf[Array[Byte]]
+        )
+    }
 
     case other => (obj: Any) => nullSafeConvert(obj)(PartialFunction.empty)
   }

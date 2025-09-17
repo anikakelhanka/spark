@@ -37,6 +37,7 @@ from pyspark.sql.types import (
     StringType,
     BinaryType,
     DateType,
+    TimeType,
     TimestampType,
     TimestampNTZType,
     DayTimeIntervalType,
@@ -57,14 +58,17 @@ from pyspark.loose_version import LooseVersion
 if TYPE_CHECKING:
     import pandas as pd
     import pyarrow as pa
+    import numpy as np
 
     from pyspark.sql.pandas._typing import SeriesLike as PandasSeriesLike
+    from pyspark.sql.pandas._typing import DataFrameLike as PandasDataFrameLike
 
 
 def to_arrow_type(
     dt: DataType,
     error_on_duplicated_field_names_in_struct: bool = False,
     timestamp_utc: bool = True,
+    prefers_large_types: bool = False,
 ) -> "pa.DataType":
     """
     Convert Spark data type to PyArrow type
@@ -105,8 +109,12 @@ def to_arrow_type(
         arrow_type = pa.float64()
     elif type(dt) == DecimalType:
         arrow_type = pa.decimal128(dt.precision, dt.scale)
+    elif type(dt) == StringType and prefers_large_types:
+        arrow_type = pa.large_string()
     elif type(dt) == StringType:
         arrow_type = pa.string()
+    elif type(dt) == BinaryType and prefers_large_types:
+        arrow_type = pa.large_binary()
     elif type(dt) == BinaryType:
         arrow_type = pa.binary()
     elif type(dt) == DateType:
@@ -120,22 +128,39 @@ def to_arrow_type(
         arrow_type = pa.timestamp("us", tz=None)
     elif type(dt) == DayTimeIntervalType:
         arrow_type = pa.duration("us")
+    elif type(dt) == TimeType:
+        arrow_type = pa.time64("ns")
     elif type(dt) == ArrayType:
         field = pa.field(
             "element",
-            to_arrow_type(dt.elementType, error_on_duplicated_field_names_in_struct, timestamp_utc),
+            to_arrow_type(
+                dt.elementType,
+                error_on_duplicated_field_names_in_struct,
+                timestamp_utc,
+                prefers_large_types,
+            ),
             nullable=dt.containsNull,
         )
         arrow_type = pa.list_(field)
     elif type(dt) == MapType:
         key_field = pa.field(
             "key",
-            to_arrow_type(dt.keyType, error_on_duplicated_field_names_in_struct, timestamp_utc),
+            to_arrow_type(
+                dt.keyType,
+                error_on_duplicated_field_names_in_struct,
+                timestamp_utc,
+                prefers_large_types,
+            ),
             nullable=False,
         )
         value_field = pa.field(
             "value",
-            to_arrow_type(dt.valueType, error_on_duplicated_field_names_in_struct, timestamp_utc),
+            to_arrow_type(
+                dt.valueType,
+                error_on_duplicated_field_names_in_struct,
+                timestamp_utc,
+                prefers_large_types,
+            ),
             nullable=dt.valueContainsNull,
         )
         arrow_type = pa.map_(key_field, value_field)
@@ -143,14 +168,17 @@ def to_arrow_type(
         field_names = dt.names
         if error_on_duplicated_field_names_in_struct and len(set(field_names)) != len(field_names):
             raise UnsupportedOperationException(
-                error_class="DUPLICATED_FIELD_NAME_IN_ARROW_STRUCT",
-                message_parameters={"field_names": str(field_names)},
+                errorClass="DUPLICATED_FIELD_NAME_IN_ARROW_STRUCT",
+                messageParameters={"field_names": str(field_names)},
             )
         fields = [
             pa.field(
                 field.name,
                 to_arrow_type(
-                    field.dataType, error_on_duplicated_field_names_in_struct, timestamp_utc
+                    field.dataType,
+                    error_on_duplicated_field_names_in_struct,
+                    timestamp_utc,
+                    prefers_large_types,
                 ),
                 nullable=field.nullable,
             )
@@ -161,18 +189,23 @@ def to_arrow_type(
         arrow_type = pa.null()
     elif isinstance(dt, UserDefinedType):
         arrow_type = to_arrow_type(
-            dt.sqlType(), error_on_duplicated_field_names_in_struct, timestamp_utc
+            dt.sqlType(),
+            error_on_duplicated_field_names_in_struct,
+            timestamp_utc,
+            prefers_large_types,
         )
     elif type(dt) == VariantType:
         fields = [
             pa.field("value", pa.binary(), nullable=False),
-            pa.field("metadata", pa.binary(), nullable=False),
+            # The metadata field is tagged so we can identify that the arrow struct actually
+            # represents a variant.
+            pa.field("metadata", pa.binary(), nullable=False, metadata={b"variant": b"true"}),
         ]
         arrow_type = pa.struct(fields)
     else:
         raise PySparkTypeError(
-            error_class="UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION",
-            message_parameters={"data_type": str(dt)},
+            errorClass="UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION",
+            messageParameters={"data_type": str(dt)},
         )
     return arrow_type
 
@@ -181,6 +214,7 @@ def to_arrow_schema(
     schema: StructType,
     error_on_duplicated_field_names_in_struct: bool = False,
     timestamp_utc: bool = True,
+    prefers_large_types: bool = False,
 ) -> "pa.Schema":
     """
     Convert a schema from Spark to Arrow
@@ -208,12 +242,34 @@ def to_arrow_schema(
     fields = [
         pa.field(
             field.name,
-            to_arrow_type(field.dataType, error_on_duplicated_field_names_in_struct, timestamp_utc),
+            to_arrow_type(
+                field.dataType,
+                error_on_duplicated_field_names_in_struct,
+                timestamp_utc,
+                prefers_large_types,
+            ),
             nullable=field.nullable,
         )
         for field in schema
     ]
     return pa.schema(fields)
+
+
+def is_variant(at: "pa.DataType") -> bool:
+    """Check if a PyArrow struct data type represents a variant"""
+    import pyarrow.types as types
+
+    assert types.is_struct(at)
+
+    return any(
+        (
+            field.name == "metadata"
+            and field.metadata is not None
+            and b"variant" in field.metadata
+            and field.metadata[b"variant"] == b"true"
+        )
+        for field in at
+    ) and any(field.name == "value" for field in at)
 
 
 def from_arrow_type(at: "pa.DataType", prefer_timestamp_ntz: bool = False) -> DataType:
@@ -249,6 +305,8 @@ def from_arrow_type(at: "pa.DataType", prefer_timestamp_ntz: bool = False) -> Da
         spark_type = BinaryType()
     elif types.is_date32(at):
         spark_type = DateType()
+    elif types.is_time64(at):
+        spark_type = TimeType()
     elif types.is_timestamp(at) and prefer_timestamp_ntz and at.tz is None:
         spark_type = TimestampNTZType()
     elif types.is_timestamp(at):
@@ -256,25 +314,29 @@ def from_arrow_type(at: "pa.DataType", prefer_timestamp_ntz: bool = False) -> Da
     elif types.is_duration(at):
         spark_type = DayTimeIntervalType()
     elif types.is_list(at):
-        spark_type = ArrayType(from_arrow_type(at.value_type, prefer_timestamp_ntz))
+        spark_type = ArrayType(
+            elementType=from_arrow_type(at.value_type, prefer_timestamp_ntz),
+            containsNull=at.value_field.nullable,
+        )
     elif types.is_fixed_size_list(at):
-        import pyarrow as pa
-
-        if LooseVersion(pa.__version__) < LooseVersion("14.0.0"):
-            # PyArrow versions before 14.0.0 do not support casting FixedSizeListArray to ListArray
-            raise PySparkTypeError(
-                error_class="UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION",
-                message_parameters={"data_type": str(at)},
-            )
-        spark_type = ArrayType(from_arrow_type(at.value_type, prefer_timestamp_ntz))
+        spark_type = ArrayType(
+            elementType=from_arrow_type(at.value_type, prefer_timestamp_ntz),
+            containsNull=at.value_field.nullable,
+        )
     elif types.is_large_list(at):
-        spark_type = ArrayType(from_arrow_type(at.value_type, prefer_timestamp_ntz))
+        spark_type = ArrayType(
+            elementType=from_arrow_type(at.value_type, prefer_timestamp_ntz),
+            containsNull=at.value_field.nullable,
+        )
     elif types.is_map(at):
         spark_type = MapType(
-            from_arrow_type(at.key_type, prefer_timestamp_ntz),
-            from_arrow_type(at.item_type, prefer_timestamp_ntz),
+            keyType=from_arrow_type(at.key_type, prefer_timestamp_ntz),
+            valueType=from_arrow_type(at.item_type, prefer_timestamp_ntz),
+            valueContainsNull=at.item_field.nullable,
         )
     elif types.is_struct(at):
+        if is_variant(at):
+            return VariantType()
         return StructType(
             [
                 StructField(
@@ -291,8 +353,8 @@ def from_arrow_type(at: "pa.DataType", prefer_timestamp_ntz: bool = False) -> Da
         spark_type = NullType()
     else:
         raise PySparkTypeError(
-            error_class="UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION",
-            message_parameters={"data_type": str(at)},
+            errorClass="UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION",
+            messageParameters={"data_type": str(at)},
         )
     return spark_type
 
@@ -888,8 +950,8 @@ def _create_converter_to_pandas(
 
             if error_on_duplicated_field_names and len(set(field_names)) != len(field_names):
                 raise UnsupportedOperationException(
-                    error_class="DUPLICATED_FIELD_NAME_IN_ARROW_STRUCT",
-                    message_parameters={"field_names": str(field_names)},
+                    errorClass="DUPLICATED_FIELD_NAME_IN_ARROW_STRUCT",
+                    messageParameters={"field_names": str(field_names)},
                 )
 
             dedup_field_names = _dedup_names(field_names)
@@ -970,8 +1032,8 @@ def _create_converter_to_pandas(
 
             else:
                 raise PySparkValueError(
-                    error_class="UNKNOWN_VALUE_FOR",
-                    message_parameters={"var": str(_struct_in_pandas)},
+                    errorClass="UNKNOWN_VALUE_FOR",
+                    messageParameters={"var": str(_struct_in_pandas)},
                 )
 
         elif isinstance(dt, TimestampType):
@@ -1032,7 +1094,7 @@ def _create_converter_to_pandas(
                 ):
                     return VariantVal(value["value"], value["metadata"])
                 else:
-                    raise PySparkValueError(error_class="MALFORMED_VARIANT")
+                    raise PySparkValueError(errorClass="MALFORMED_VARIANT")
 
             return convert_variant
 
@@ -1185,8 +1247,8 @@ def _create_converter_from_pandas(
 
             if error_on_duplicated_field_names and len(set(field_names)) != len(field_names):
                 raise UnsupportedOperationException(
-                    error_class="DUPLICATED_FIELD_NAME_IN_ARROW_STRUCT",
-                    message_parameters={"field_names": str(field_names)},
+                    errorClass="DUPLICATED_FIELD_NAME_IN_ARROW_STRUCT",
+                    messageParameters={"field_names": str(field_names)},
                 )
 
             dedup_field_names = _dedup_names(field_names)
@@ -1290,6 +1352,14 @@ def _create_converter_from_pandas(
 
             return convert_udt
 
+        elif isinstance(dt, VariantType):
+
+            def convert_variant(variant: Any) -> Any:
+                assert isinstance(variant, VariantVal)
+                return {"value": variant.value, "metadata": variant.metadata}
+
+            return convert_variant
+
         return None
 
     conv = _converter(data_type)
@@ -1344,3 +1414,51 @@ def _deduplicate_field_names(dt: DataType) -> DataType:
         )
     else:
         return dt
+
+
+def _to_numpy_type(type: DataType) -> Optional["np.dtype"]:
+    """Convert Spark data type to NumPy type."""
+    import numpy as np
+
+    if type == ByteType():
+        return np.dtype("int8")
+    elif type == ShortType():
+        return np.dtype("int16")
+    elif type == IntegerType():
+        return np.dtype("int32")
+    elif type == LongType():
+        return np.dtype("int64")
+    elif type == FloatType():
+        return np.dtype("float32")
+    elif type == DoubleType():
+        return np.dtype("float64")
+    elif type == TimestampType():
+        return np.dtype("datetime64[us]")
+    elif type == TimestampNTZType():
+        return np.dtype("datetime64[us]")
+    elif type == DayTimeIntervalType():
+        return np.dtype("timedelta64[us]")
+    return None
+
+
+def convert_pandas_using_numpy_type(
+    df: "PandasDataFrameLike", schema: StructType
+) -> "PandasDataFrameLike":
+    for field in schema.fields:
+        if isinstance(
+            field.dataType,
+            (
+                ByteType,
+                ShortType,
+                IntegerType,
+                LongType,
+                FloatType,
+                DoubleType,
+                TimestampType,
+                TimestampNTZType,
+                DayTimeIntervalType,
+            ),
+        ):
+            np_type = _to_numpy_type(field.dataType)
+            df[field.name] = df[field.name].astype(np_type)
+    return df

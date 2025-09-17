@@ -26,8 +26,19 @@ import org.apache.spark.sql.catalyst.trees.{CurrentOrigin, Origin}
 
 trait SparkParserUtils {
 
-  /** Unescape backslash-escaped string enclosed by quotes. */
-  def unescapeSQLString(b: String): String = {
+  /**
+   * Unescape escaped string enclosed by quotes, with support for:
+   *   1. Double-quote escaping (`""`, `''`)
+   *   2. Traditional backslash escaping (\n, \t, \", etc.)
+   *
+   * @param b
+   *   The input string
+   * @param ignoreQuoteQuote
+   *   If true, consecutive quotes (`''` or `""`) are treated as string concatenation and will be
+   *   removed directly (e.g., `'a''b'` → `ab`). If false, they are treated as escape sequences
+   *   (e.g., `'a''b'` → `a'b`). Default is false (standard SQL escaping).
+   */
+  def unescapeSQLString(b: String, ignoreQuoteQuote: Boolean = false): String = {
     def appendEscapedChar(n: Char, sb: JStringBuilder): Unit = {
       n match {
         case '0' => sb.append('\u0000')
@@ -62,8 +73,8 @@ trait SparkParserUtils {
       val secondChar = s.charAt(start + 1)
       val thirdChar = s.charAt(start + 2)
       (firstChar == '0' || firstChar == '1') &&
-        (secondChar >= '0' && secondChar <= '7') &&
-        (thirdChar >= '0' && thirdChar <= '7')
+      (secondChar >= '0' && secondChar <= '7') &&
+      (thirdChar >= '0' && thirdChar <= '7')
     }
 
     val isRawString = {
@@ -71,10 +82,20 @@ trait SparkParserUtils {
       firstChar == 'r' || firstChar == 'R'
     }
 
+    val isDoubleQuotedString = {
+      b.charAt(0) == '"'
+    }
+
+    val isSingleQuotedString = {
+      b.charAt(0) == '\''
+    }
+
     if (isRawString) {
       // Skip the 'r' or 'R' and the first and last quotations enclosing the string literal.
       b.substring(2, b.length - 1)
-    } else if (b.indexOf('\\') == -1) {
+    } else if (b.indexOf('\\') == -1 &&
+      (!isDoubleQuotedString || b.indexOf("\"\"") == -1) &&
+      (!isSingleQuotedString || b.indexOf("''") == -1)) {
       // Fast path for the common case where the string has no escaped characters,
       // in which case we just skip the first and last quotations enclosing the string literal.
       b.substring(1, b.length - 1)
@@ -85,7 +106,19 @@ trait SparkParserUtils {
       val length = b.length - 1
       while (i < length) {
         val c = b.charAt(i)
-        if (c != '\\' || i + 1 == length) {
+        // First check for double-quote escaping (`""`, `''`)
+        if (isDoubleQuotedString && c == '"' && i + 1 < length && b.charAt(i + 1) == '"') {
+          if (!ignoreQuoteQuote) {
+            sb.append('"')
+          }
+          i += 2
+        } else if (isSingleQuotedString && c == '\'' && i + 1 < length && b.charAt(
+            i + 1) == '\'') {
+          if (!ignoreQuoteQuote) {
+            sb.append('\'')
+          }
+          i += 2
+        } else if (c != '\\' || i + 1 == length) {
           // Either a regular character or a backslash at the end of the string:
           sb.append(c)
           i += 1
@@ -97,15 +130,18 @@ trait SparkParserUtils {
             // \u0000 style 16-bit unicode character literals.
             sb.append(Integer.parseInt(b, i + 1, i + 1 + 4, 16).toChar)
             i += 1 + 4
-          } else if (cAfterBackslash == 'U' && i + 1 + 8 <= length && allCharsAreHex(b, i + 1, 8)) {
+          } else if (cAfterBackslash == 'U' && i + 1 + 8 <= length && allCharsAreHex(
+              b,
+              i + 1,
+              8)) {
             // \U00000000 style 32-bit unicode character literals.
             // Use Long to treat codePoint as unsigned in the range of 32-bit.
             val codePoint = JLong.parseLong(b, i + 1, i + 1 + 8, 16)
             if (codePoint < 0x10000) {
-              sb.append((codePoint & 0xFFFF).toChar)
+              sb.append((codePoint & 0xffff).toChar)
             } else {
-              val highSurrogate = (codePoint - 0x10000) / 0x400 + 0xD800
-              val lowSurrogate = (codePoint - 0x10000) % 0x400 + 0xDC00
+              val highSurrogate = (codePoint - 0x10000) / 0x400 + 0xd800
+              val lowSurrogate = (codePoint - 0x10000) % 0x400 + 0xdc00
               sb.append(highSurrogate.toChar)
               sb.append(lowSurrogate.toChar)
             }
@@ -124,8 +160,19 @@ trait SparkParserUtils {
     }
   }
 
+  /** Get the code that creates the given node. */
+  def source(ctx: ParserRuleContext): String = {
+    // Note: `exprCtx.getText` returns a string without spaces, so we need to
+    // get the text from the underlying char stream instead.
+    val stream = ctx.getStart.getInputStream
+    stream.getText(Interval.of(ctx.getStart.getStartIndex, ctx.getStop.getStopIndex))
+  }
+
   /** Convert a string token into a string. */
   def string(token: Token): String = unescapeSQLString(token.getText)
+
+  /** Convert a string token into a string and remove `""` and `''`. */
+  def stringIgnoreQuoteQuote(token: Token): String = unescapeSQLString(token.getText, true)
 
   /** Convert a string node into a string. */
   def string(node: TerminalNode): String = unescapeSQLString(node.getText)
@@ -147,8 +194,13 @@ trait SparkParserUtils {
     if (text.isEmpty) {
       CurrentOrigin.set(position(ctx.getStart))
     } else {
-      CurrentOrigin.set(positionAndText(ctx.getStart, ctx.getStop, text.get,
-        current.objectType, current.objectName))
+      CurrentOrigin.set(
+        positionAndText(
+          ctx.getStart,
+          ctx.getStop,
+          text.get,
+          current.objectType,
+          current.objectName))
     }
     try {
       f

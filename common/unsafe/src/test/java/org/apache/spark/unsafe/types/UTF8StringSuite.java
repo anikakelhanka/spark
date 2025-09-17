@@ -24,8 +24,9 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 
-import com.google.common.collect.ImmutableMap;
 import org.apache.spark.unsafe.Platform;
+import org.apache.spark.unsafe.UTF8StringBuilder;
+
 import org.junit.jupiter.api.Test;
 
 import static org.apache.spark.unsafe.types.UTF8String.fromString;
@@ -430,7 +431,7 @@ public class UTF8StringSuite {
       new UTF8String[]{fromString("a"), fromString("b")},
       fromString("ab").split(fromString(""), 100));
     assertArrayEquals(
-      new UTF8String[]{fromString("a")},
+      new UTF8String[]{fromString("ab")},
       fromString("ab").split(fromString(""), 1));
     assertArrayEquals(
       new UTF8String[]{fromString("")},
@@ -493,7 +494,7 @@ public class UTF8StringSuite {
   public void translate() {
     assertEquals(
       fromString("1a2s3ae"),
-      fromString("translate").translate(ImmutableMap.of(
+      fromString("translate").translate(Map.of(
         "r", "1",
         "n", "2",
         "l", "3",
@@ -504,7 +505,7 @@ public class UTF8StringSuite {
       fromString("translate").translate(new HashMap<>()));
     assertEquals(
       fromString("asae"),
-      fromString("translate").translate(ImmutableMap.of(
+      fromString("translate").translate(Map.of(
         "r", "\0",
         "n", "\0",
         "l", "\0",
@@ -512,7 +513,7 @@ public class UTF8StringSuite {
       )));
     assertEquals(
       fromString("aa世b"),
-      fromString("花花世界").translate(ImmutableMap.of(
+      fromString("花花世界").translate(Map.of(
         "花", "a",
         "界", "b"
       )));
@@ -1361,5 +1362,28 @@ public class UTF8StringSuite {
     assertEquals(
       UTF8String.fromString("111111111111111111111111111111111111111111111111111111111111111"),
       UTF8String.toBinaryString(Long.MAX_VALUE));
+  }
+
+  /**
+   * This tests whether appending a codepoint to a 'UTF8StringBuilder' correctly appends every
+   * single codepoint. We test it against an already existing 'StringBuilder.appendCodePoint' and
+   * 'UTF8String.fromString'. We skip testing the surrogate codepoints because at some point while
+   * converting the surrogate codepoint to 'UTF8String' (via 'StringBuilder' and 'UTF8String') we
+   * get an ill-formated byte sequence (probably because 'String' is in UTF-16 format, and a single
+   * surrogate codepoint is handled differently in UTF-16 than in UTF-8, so somewhere during those
+   * conversions some different behaviour happens).
+   */
+  @Test
+  public void testAppendCodepointToUTF8StringBuilder() {
+    int surrogateRangeLowerBound = 0xD800;
+    int surrogateRangeUpperBound = 0xDFFF;
+    for (int i = Character.MIN_CODE_POINT; i <= Character.MAX_CODE_POINT; ++i) {
+      if(surrogateRangeLowerBound <= i && i <= surrogateRangeUpperBound) continue;
+      UTF8StringBuilder usb = new UTF8StringBuilder();
+      usb.appendCodePoint(i);
+      StringBuilder sb = new StringBuilder();
+      sb.appendCodePoint(i);
+      assert(usb.build().equals(UTF8String.fromString(sb.toString())));
+    }
   }
 }

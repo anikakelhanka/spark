@@ -553,25 +553,13 @@ class SparkConnectPlanTests(PlanOnlyTestFixture):
         self.assertEqual(deduplicate_on_all_columns_plan.root.deduplicate.all_columns_as_keys, True)
         self.assertEqual(len(deduplicate_on_all_columns_plan.root.deduplicate.column_names), 0)
 
-        deduplicate_on_subset_columns_plan_list_arg = df.dropDuplicates(
-            ["name", "height"]
-        )._plan.to_proto(self.connect)
-        self.assertEqual(
-            deduplicate_on_subset_columns_plan_list_arg.root.deduplicate.all_columns_as_keys, False
+        deduplicate_on_subset_columns_plan = df.dropDuplicates(["name", "height"])._plan.to_proto(
+            self.connect
         )
         self.assertEqual(
-            len(deduplicate_on_subset_columns_plan_list_arg.root.deduplicate.column_names), 2
+            deduplicate_on_subset_columns_plan.root.deduplicate.all_columns_as_keys, False
         )
-
-        deduplicate_on_subset_columns_plan_var_arg = df.dropDuplicates(
-            "name", "height"
-        )._plan.to_proto(self.connect)
-        self.assertEqual(
-            deduplicate_on_subset_columns_plan_var_arg.root.deduplicate.all_columns_as_keys, False
-        )
-        self.assertEqual(
-            len(deduplicate_on_subset_columns_plan_var_arg.root.deduplicate.column_names), 2
-        )
+        self.assertEqual(len(deduplicate_on_subset_columns_plan.root.deduplicate.column_names), 2)
 
     def test_relation_alias(self):
         df = self.connect.readTable(table_name=self.tbl_name)
@@ -668,8 +656,8 @@ class SparkConnectPlanTests(PlanOnlyTestFixture):
 
         self.check_error(
             exception=pe.exception,
-            error_class="VALUE_NOT_POSITIVE",
-            message_parameters={"arg_name": "numPartitions", "arg_value": "-1"},
+            errorClass="VALUE_NOT_POSITIVE",
+            messageParameters={"arg_name": "numPartitions", "arg_value": "-1"},
         )
 
         with self.assertRaises(PySparkValueError) as pe:
@@ -677,8 +665,8 @@ class SparkConnectPlanTests(PlanOnlyTestFixture):
 
         self.check_error(
             exception=pe.exception,
-            error_class="VALUE_NOT_POSITIVE",
-            message_parameters={"arg_name": "numPartitions", "arg_value": "-1"},
+            errorClass="VALUE_NOT_POSITIVE",
+            messageParameters={"arg_name": "numPartitions", "arg_value": "-1"},
         )
 
     def test_repartition_by_expression(self):
@@ -905,7 +893,7 @@ class SparkConnectPlanTests(PlanOnlyTestFixture):
         self.assertIsNotNone(inf_lit.to_plan(None))
 
     def test_datetime_literal_types(self):
-        """Test the different timestamp, date, and timedelta types."""
+        """Test the different timestamp, date, time, and timedelta types."""
         datetime_lit = lit(datetime.datetime.now())
 
         p = datetime_lit.to_plan(None)
@@ -919,6 +907,10 @@ class SparkConnectPlanTests(PlanOnlyTestFixture):
         self.assertIsNotNone(time_delta.to_plan(None))
         # (24 * 3600 + 2) * 1000000 + 3
         self.assertEqual(86402000003, time_delta.to_plan(None).literal.day_time_interval)
+
+        time_lit = lit(datetime.time(23, 59, 59, 999999))
+        self.assertIsNotNone(time_lit.to_plan(None))
+        self.assertEqual(time_lit.to_plan(None).literal.time.nano, 86399999999000)
 
     def test_list_to_literal(self):
         """Test conversion of lists to literals"""
@@ -1036,6 +1028,7 @@ class SparkConnectPlanTests(PlanOnlyTestFixture):
             decimal.Decimal(1.234567),
             "sss",
             datetime.date(2022, 12, 13),
+            datetime.time(12, 13, 14),
             datetime.datetime.now(),
             datetime.timedelta(1, 2, 3),
             [1, 2, 3, 4, 5, 6],

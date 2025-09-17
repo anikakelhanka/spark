@@ -83,6 +83,20 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
    */
   private volatile int numBytesValid = -1;
 
+  /**
+   * The ASCII-ness of the UTF8Strings can be cached to avoid repeated checks, because that
+   * operation requires full string scan. Full ASCII strings contain only ASCII characters.
+   */
+  private enum IsFullAscii {
+    UNKNOWN, FULL_ASCII, NOT_ASCII
+  }
+
+  /**
+   * Internal flag to indicate whether the string is full ASCII or not. Initially, the ASCII-ness
+   * is UNKNOWN, and will be set to either FULL_ASCII or NOT_ASCII after the first check.
+   */
+  private volatile IsFullAscii isFullAscii = IsFullAscii.UNKNOWN;
+
   public Object getBaseObject() { return base; }
   public long getBaseOffset() { return offset; }
 
@@ -127,6 +141,7 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
   private static final UTF8String COMMA_UTF8 = UTF8String.fromString(",");
   public static final UTF8String EMPTY_UTF8 = UTF8String.fromString("");
   public static final UTF8String ZERO_UTF8 = UTF8String.fromString("0");
+  public static final UTF8String SPACE_UTF8 = UTF8String.fromString(" ");
 
 
   /**
@@ -627,9 +642,13 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
     }
 
     int j = i;
-    while (i < numBytes && c < until) {
-      i += numBytesForFirstByte(getByte(i));
-      c += 1;
+    if (until == Integer.MAX_VALUE) {
+      i = numBytes;
+    } else {
+      while (i < numBytes && c < until) {
+        i += numBytesForFirstByte(getByte(i));
+        c += 1;
+      }
     }
 
     if (i > j) {
@@ -648,9 +667,8 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
     // refers to element i-1 in the sequence. If a start index i is less than 0, it refers
     // to the -ith element before the end of the sequence. If a start index i is 0, it
     // refers to the first element.
-    int len = numChars();
     // `len + pos` does not overflow as `len >= 0`.
-    int start = (pos > 0) ? pos -1 : ((pos < 0) ? len + pos : 0);
+    int start = (pos > 0) ? pos -1 : ((pos < 0) ? numChars() + pos : 0);
 
     int end;
     if ((long) start + length > Integer.MAX_VALUE) {
@@ -788,12 +806,19 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
   }
 
   public boolean isFullAscii() {
+    if (isFullAscii == IsFullAscii.UNKNOWN) {
+      isFullAscii = getIsFullAscii();
+    }
+    return isFullAscii == IsFullAscii.FULL_ASCII;
+  }
+
+  private IsFullAscii getIsFullAscii() {
     for (var i = 0; i < numBytes; i++) {
       if (getByte(i) < 0) {
-        return false;
+        return IsFullAscii.NOT_ASCII;
       }
     }
-    return true;
+    return IsFullAscii.FULL_ASCII;
   }
 
   private UTF8String toLowerCaseSlow() {
@@ -1146,8 +1171,19 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
   }
 
   public UTF8String repeat(int times) {
-    if (times <= 0) {
+    if (times <= 0 || numBytes == 0) {
       return EMPTY_UTF8;
+    }
+
+    if (times == 1) {
+      return this;
+    }
+
+    if (numBytes == 1) {
+      byte[] newBytes = new byte[times];
+      byte b = getByte(0);
+      Arrays.fill(newBytes, b);
+      return fromBytes(newBytes);
     }
 
     byte[] newBytes = new byte[Math.multiplyExact(numBytes, times)];
@@ -1461,6 +1497,25 @@ public final class UTF8String implements Comparable<UTF8String>, Externalizable,
   }
 
   public UTF8String[] split(UTF8String pattern, int limit) {
+    // For the empty `pattern` a `split` function ignores trailing empty strings unless original
+    // string is empty.
+    if (numBytes() != 0 && pattern.numBytes() == 0) {
+      int newLimit = limit > numChars() || limit <= 0 ? numChars() : limit;
+      byte[] input = getBytes();
+      int byteIndex = 0;
+      UTF8String[] result = new UTF8String[newLimit];
+      for (int charIndex = 0; charIndex < newLimit - 1; charIndex++) {
+        int currCharNumBytes = numBytesForFirstByte(input[byteIndex]);
+        result[charIndex] = UTF8String.fromBytes(input, byteIndex, currCharNumBytes);
+        byteIndex += currCharNumBytes;
+      }
+      result[newLimit - 1] = UTF8String.fromBytes(input, byteIndex, numBytes() - byteIndex);
+      return result;
+    }
+    return split(pattern.toString(), limit);
+  }
+
+  public UTF8String[] splitLegacyTruncate(UTF8String pattern, int limit) {
     // For the empty `pattern` a `split` function ignores trailing empty strings unless original
     // string is empty.
     if (numBytes() != 0 && pattern.numBytes() == 0) {

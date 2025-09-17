@@ -331,6 +331,21 @@ class InMemoryCatalog(
     catalog(db).tables(table).table = origTable.copy(schema = newSchema)
   }
 
+  override def alterTableSchema(
+      db: String,
+      table: String,
+      newSchema: StructType): Unit = synchronized {
+    requireTableExists(db, table)
+    val origTable = catalog(db).tables(table).table
+
+    val partCols = origTable.partitionColumnNames
+    assert(newSchema.map(_.name).takeRight(partCols.length) == partCols,
+      s"Partition columns ${partCols.mkString("[", ", ", "]")} are only supported at the end of " +
+        s"the new schema ${newSchema.catalogString} for now.")
+
+    catalog(db).tables(table).table = origTable.copy(schema = newSchema)
+  }
+
   override def alterTableStats(
       db: String,
       table: String,
@@ -509,7 +524,7 @@ class InMemoryCatalog(
         try {
           val fs = tablePath.getFileSystem(hadoopConfig)
           fs.mkdirs(newPartPath)
-          if(!fs.rename(oldPartPath, newPartPath)) {
+          if (!fs.rename(oldPartPath, newPartPath)) {
             throw new IOException(s"Renaming partition path from $oldPartPath to " +
               s"$newPartPath returned false")
           }

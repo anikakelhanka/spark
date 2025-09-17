@@ -46,13 +46,16 @@ import org.apache.spark.unsafe.types.CalendarInterval
 case class UnaryMinus(
     child: Expression,
     failOnError: Boolean = SQLConf.get.ansiEnabled)
-  extends UnaryExpression with ImplicitCastInputTypes with NullIntolerant {
+  extends UnaryExpression with ImplicitCastInputTypes {
+  override def nullIntolerant: Boolean = true
 
   def this(child: Expression) = this(child, SQLConf.get.ansiEnabled)
 
   override def inputTypes: Seq[AbstractDataType] = Seq(TypeCollection.NumericAndInterval)
 
   override def dataType: DataType = child.dataType
+
+  override def contextIndependentFoldable: Boolean = child.contextIndependentFoldable
 
   override def toString: String = s"-$child"
 
@@ -114,7 +117,7 @@ case class UnaryMinus(
   since = "1.5.0",
   group = "math_funcs")
 case class UnaryPositive(child: Expression)
-  extends RuntimeReplaceable with ImplicitCastInputTypes with NullIntolerant {
+  extends UnaryExpression with RuntimeReplaceable with ImplicitCastInputTypes {
 
   override def prettyName: String = "positive"
 
@@ -122,15 +125,14 @@ case class UnaryPositive(child: Expression)
 
   override def dataType: DataType = child.dataType
 
+  override def contextIndependentFoldable: Boolean = child.contextIndependentFoldable
+
   override def sql: String = s"(+ ${child.sql})"
 
   override lazy val replacement: Expression = child
 
-  override protected def withNewChildrenInternal(
-      newChildren: IndexedSeq[Expression]): UnaryPositive =
-    copy(newChildren.head)
-
-  override def children: Seq[Expression] = child :: Nil
+  override protected def withNewChildInternal(newChild: Expression): Expression =
+    copy(child = newChild)
 }
 
 /**
@@ -148,13 +150,16 @@ case class UnaryPositive(child: Expression)
   since = "1.2.0",
   group = "math_funcs")
 case class Abs(child: Expression, failOnError: Boolean = SQLConf.get.ansiEnabled)
-  extends UnaryExpression with ImplicitCastInputTypes with NullIntolerant {
+  extends UnaryExpression with ImplicitCastInputTypes {
+  override def nullIntolerant: Boolean = true
 
   def this(child: Expression) = this(child, SQLConf.get.ansiEnabled)
 
   override def inputTypes: Seq[AbstractDataType] = Seq(TypeCollection.NumericAndAnsiInterval)
 
   override def dataType: DataType = child.dataType
+
+  override def contextIndependentFoldable: Boolean = child.contextIndependentFoldable
 
   private lazy val numeric = (dataType match {
     case _: DayTimeIntervalType => LongExactNumeric
@@ -185,8 +190,11 @@ case class Abs(child: Expression, failOnError: Boolean = SQLConf.get.ansiEnabled
   override protected def withNewChildInternal(newChild: Expression): Abs = copy(child = newChild)
 }
 
-abstract class BinaryArithmetic extends BinaryOperator
-  with NullIntolerant with SupportQueryContext {
+abstract class BinaryArithmetic extends BinaryOperator with SupportQueryContext {
+  override def nullIntolerant: Boolean = true
+
+  override def contextIndependentFoldable: Boolean =
+    left.contextIndependentFoldable && right.contextIndependentFoldable
 
   protected val evalMode: EvalMode.Value
 
@@ -294,12 +302,18 @@ abstract class BinaryArithmetic extends BinaryOperator
     case ByteType | ShortType =>
       nullSafeCodeGen(ctx, ev, (eval1, eval2) => {
         val tmpResult = ctx.freshName("tmpResult")
+        val try_suggestion = symbol match {
+          case "+" => "try_add"
+          case "-" => "try_subtract"
+          case "*" => "try_multiply"
+          case _ => "unknown_function"
+        }
         val overflowCheck = if (failOnError) {
           val javaType = CodeGenerator.boxedType(dataType)
           s"""
              |if ($tmpResult < $javaType.MIN_VALUE || $tmpResult > $javaType.MAX_VALUE) {
              |  throw QueryExecutionErrors.binaryArithmeticCauseOverflowError(
-             |  $eval1, "$symbol", $eval2);
+             |  $eval1, "$symbol", $eval2, "$try_suggestion");
              |}
            """.stripMargin
         } else {
@@ -1188,6 +1202,7 @@ case class Least(children: Seq[Expression]) extends ComplexTypeMergingExpression
 
   override def nullable: Boolean = children.forall(_.nullable)
   override def foldable: Boolean = children.forall(_.foldable)
+  override def contextIndependentFoldable: Boolean = children.forall(_.contextIndependentFoldable)
 
   private lazy val ordering = TypeUtils.getInterpretedOrdering(dataType)
 
@@ -1276,6 +1291,7 @@ case class Greatest(children: Seq[Expression]) extends ComplexTypeMergingExpress
 
   override def nullable: Boolean = children.forall(_.nullable)
   override def foldable: Boolean = children.forall(_.foldable)
+  override def contextIndependentFoldable: Boolean = children.forall(_.contextIndependentFoldable)
 
   private lazy val ordering = TypeUtils.getInterpretedOrdering(dataType)
 

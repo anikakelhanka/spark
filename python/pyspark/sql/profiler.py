@@ -20,6 +20,7 @@ import os
 import pstats
 from threading import RLock
 from typing import Any, Callable, Dict, Literal, Optional, Tuple, Union, TYPE_CHECKING, overload
+import warnings
 
 from pyspark.accumulators import (
     Accumulator,
@@ -28,7 +29,13 @@ from pyspark.accumulators import (
     _accumulatorRegistry,
 )
 from pyspark.errors import PySparkValueError
-from pyspark.profiler import CodeMapDict, MemoryProfiler, MemUsageParam, PStatsParam
+from pyspark.profiler import (
+    CodeMapDict,
+    MemoryProfiler,
+    MemUsageParam,
+    PStatsParam,
+    has_memory_profiler,
+)
 
 if TYPE_CHECKING:
     from pyspark.sql._typing import ProfileResults
@@ -130,6 +137,12 @@ class ProfilerCollector(ABC):
         with self._lock:
             code_map = self._memory_profile_results
 
+        if not has_memory_profiler and not code_map:
+            warnings.warn(
+                "Install the 'memory_profiler' library in the cluster to enable memory profiling",
+                UserWarning,
+            )
+
         def show(id: int) -> None:
             cm = code_map.get(id)
             if cm is not None:
@@ -181,8 +194,7 @@ class ProfilerCollector(ABC):
             s = stats.get(id)
 
             if s is not None:
-                if not os.path.exists(path):
-                    os.makedirs(path)
+                os.makedirs(path, exist_ok=True)
                 p = os.path.join(path, f"udf_{id}_perf.pstats")
                 s.dump_stats(p)
 
@@ -208,12 +220,17 @@ class ProfilerCollector(ABC):
         with self._lock:
             code_map = self._memory_profile_results
 
+        if not has_memory_profiler and not code_map:
+            warnings.warn(
+                "Install the 'memory_profiler' library in the cluster to enable memory profiling",
+                UserWarning,
+            )
+
         def dump(id: int) -> None:
             cm = code_map.get(id)
 
             if cm is not None:
-                if not os.path.exists(path):
-                    os.makedirs(path)
+                os.makedirs(path, exist_ok=True)
                 p = os.path.join(path, f"udf_{id}_memory.txt")
 
                 with open(p, "w+") as f:
@@ -297,7 +314,7 @@ class Profile:
     """User-facing profile API. This instance can be accessed by
     :attr:`spark.profile`.
 
-    .. versionadded: 4.0.0
+    .. versionadded:: 4.0.0
     """
 
     def __init__(self, profiler_collector: ProfilerCollector):
@@ -315,6 +332,12 @@ class Profile:
             A UDF ID to be shown. If not specified, all the results will be shown.
         type : str, optional
             The profiler type, which can be either "perf" or "memory".
+
+        Notes
+        -----
+        The results are gathered from all Python executions. For example, if there are
+        8 tasks, each processing 1,000 rows, the total output will display the results
+        for 8,000 rows.
         """
         if type == "memory":
             self.profiler_collector.show_memory_profiles(id)
@@ -324,8 +347,8 @@ class Profile:
                 self.profiler_collector.show_memory_profiles(id)
         else:
             raise PySparkValueError(
-                error_class="VALUE_NOT_ALLOWED",
-                message_parameters={
+                errorClass="VALUE_NOT_ALLOWED",
+                messageParameters={
                     "arg_name": "type",
                     "allowed_values": str(["perf", "memory"]),
                 },
@@ -354,8 +377,8 @@ class Profile:
                 self.profiler_collector.dump_memory_profiles(path, id)
         else:
             raise PySparkValueError(
-                error_class="VALUE_NOT_ALLOWED",
-                message_parameters={
+                errorClass="VALUE_NOT_ALLOWED",
+                messageParameters={
                     "arg_name": "type",
                     "allowed_values": str(["perf", "memory"]),
                 },
@@ -396,7 +419,8 @@ class Profile:
         id : int
             The UDF ID whose profiling results should be rendered.
         type : str, optional
-            The profiler type to clear results for, which can be either "perf" or "memory".
+            The profiler type to render results for, which can be either "perf" or "memory".
+            If not specified, defaults to "perf".
         renderer : str or callable, optional
             The renderer to use. If not specified, the default renderer will be "flameprof"
             for the "perf" profiler, which returns an :class:`IPython.display.HTML` object in
@@ -415,8 +439,8 @@ class Profile:
             result = self.profiler_collector._memory_profile_results.get(id)
         else:
             raise PySparkValueError(
-                error_class="VALUE_NOT_ALLOWED",
-                message_parameters={
+                errorClass="VALUE_NOT_ALLOWED",
+                messageParameters={
                     "arg_name": "type",
                     "allowed_values": str(["perf", "memory"]),
                 },
@@ -429,8 +453,8 @@ class Profile:
             render = renderer
         if render is None:
             raise PySparkValueError(
-                error_class="VALUE_NOT_ALLOWED",
-                message_parameters={
+                errorClass="VALUE_NOT_ALLOWED",
+                messageParameters={
                     "arg_name": "(type, renderer)",
                     "allowed_values": str(list(_renderers.keys())),
                 },
@@ -461,8 +485,8 @@ class Profile:
                 self.profiler_collector.clear_memory_profiles(id)
         else:
             raise PySparkValueError(
-                error_class="VALUE_NOT_ALLOWED",
-                message_parameters={
+                errorClass="VALUE_NOT_ALLOWED",
+                messageParameters={
                     "arg_name": "type",
                     "allowed_values": str(["perf", "memory"]),
                 },
@@ -474,8 +498,8 @@ def _render_flameprof(stats: pstats.Stats) -> Any:
         from flameprof import render
     except ImportError:
         raise PySparkValueError(
-            error_class="PACKAGE_NOT_INSTALLED",
-            message_parameters={"package_name": "flameprof", "minimum_version": "0.4"},
+            errorClass="PACKAGE_NOT_INSTALLED",
+            messageParameters={"package_name": "flameprof", "minimum_version": "0.4"},
         )
 
     buf = StringIO()

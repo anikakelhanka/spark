@@ -14,13 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import faulthandler
 import inspect
 import os
 import sys
 from typing import IO, Iterable, Iterator
 
 from pyspark.accumulators import _accumulatorRegistry
-from pyspark.sql.connect.conversion import ArrowTableToRowsConversion
+from pyspark.sql.conversion import ArrowTableToRowsConversion
 from pyspark.errors import PySparkAssertionError, PySparkRuntimeError, PySparkTypeError
 from pyspark.serializers import (
     read_bool,
@@ -32,8 +33,11 @@ from pyspark.sql import Row
 from pyspark.sql.datasource import (
     DataSource,
     DataSourceWriter,
+    DataSourceArrowWriter,
     WriterCommitMessage,
     CaseInsensitiveDict,
+    DataSourceStreamWriter,
+    DataSourceStreamArrowWriter,
 )
 from pyspark.sql.types import (
     _parse_datatype_json_string,
@@ -73,8 +77,18 @@ def main(infile: IO, outfile: IO) -> None:
     instance and send a function using the writer instance that can be used
     in mapInPandas/mapInArrow back to the JVM.
     """
+    faulthandler_log_path = os.environ.get("PYTHON_FAULTHANDLER_DIR", None)
+    tracebackDumpIntervalSeconds = os.environ.get("PYTHON_TRACEBACK_DUMP_INTERVAL_SECONDS", None)
     try:
+        if faulthandler_log_path:
+            faulthandler_log_path = os.path.join(faulthandler_log_path, str(os.getpid()))
+            faulthandler_log_file = open(faulthandler_log_path, "w")
+            faulthandler.enable(file=faulthandler_log_file)
+
         check_python_version(infile)
+
+        if tracebackDumpIntervalSeconds is not None and int(tracebackDumpIntervalSeconds) > 0:
+            faulthandler.dump_traceback_later(int(tracebackDumpIntervalSeconds), repeat=True)
 
         memory_limit_mb = int(os.environ.get("PYSPARK_PLANNER_MEMORY_MB", "-1"))
         setup_memory_limits(memory_limit_mb)
@@ -88,8 +102,8 @@ def main(infile: IO, outfile: IO) -> None:
         data_source_cls = read_command(pickleSer, infile)
         if not (isinstance(data_source_cls, type) and issubclass(data_source_cls, DataSource)):
             raise PySparkAssertionError(
-                error_class="DATA_SOURCE_TYPE_MISMATCH",
-                message_parameters={
+                errorClass="DATA_SOURCE_TYPE_MISMATCH",
+                messageParameters={
                     "expected": "a subclass of DataSource",
                     "actual": f"'{type(data_source_cls).__name__}'",
                 },
@@ -98,8 +112,8 @@ def main(infile: IO, outfile: IO) -> None:
         # Check the name method is a class method.
         if not inspect.ismethod(data_source_cls.name):
             raise PySparkTypeError(
-                error_class="DATA_SOURCE_TYPE_MISMATCH",
-                message_parameters={
+                errorClass="DATA_SOURCE_TYPE_MISMATCH",
+                messageParameters={
                     "expected": "'name()' method to be a classmethod",
                     "actual": f"'{type(data_source_cls.name).__name__}'",
                 },
@@ -111,8 +125,8 @@ def main(infile: IO, outfile: IO) -> None:
         # Check if the provider name matches the data source's name.
         if provider.lower() != data_source_cls.name().lower():
             raise PySparkAssertionError(
-                error_class="DATA_SOURCE_TYPE_MISMATCH",
-                message_parameters={
+                errorClass="DATA_SOURCE_TYPE_MISMATCH",
+                messageParameters={
                     "expected": f"provider with name {data_source_cls.name()}",
                     "actual": f"'{provider}'",
                 },
@@ -122,8 +136,8 @@ def main(infile: IO, outfile: IO) -> None:
         schema = _parse_datatype_json_string(utf8_deserializer.loads(infile))
         if not isinstance(schema, StructType):
             raise PySparkAssertionError(
-                error_class="DATA_SOURCE_TYPE_MISMATCH",
-                message_parameters={
+                errorClass="DATA_SOURCE_TYPE_MISMATCH",
+                messageParameters={
                     "expected": "the schema to be a 'StructType'",
                     "actual": f"'{type(data_source_cls).__name__}'",
                 },
@@ -133,8 +147,8 @@ def main(infile: IO, outfile: IO) -> None:
         return_type = _parse_datatype_json_string(utf8_deserializer.loads(infile))
         if not isinstance(return_type, StructType):
             raise PySparkAssertionError(
-                error_class="DATA_SOURCE_TYPE_MISMATCH",
-                message_parameters={
+                errorClass="DATA_SOURCE_TYPE_MISMATCH",
+                messageParameters={
                     "expected": "a return type of type 'StructType'",
                     "actual": f"'{type(return_type).__name__}'",
                 },
@@ -164,13 +178,24 @@ def main(infile: IO, outfile: IO) -> None:
         if is_streaming:
             # Instantiate the streaming data source writer.
             writer = data_source.streamWriter(schema, overwrite)
+            if not isinstance(writer, (DataSourceStreamWriter, DataSourceStreamArrowWriter)):
+                raise PySparkAssertionError(
+                    errorClass="DATA_SOURCE_TYPE_MISMATCH",
+                    messageParameters={
+                        "expected": (
+                            "an instance of DataSourceStreamWriter or "
+                            "DataSourceStreamArrowWriter"
+                        ),
+                        "actual": f"'{type(writer).__name__}'",
+                    },
+                )
         else:
             # Instantiate the data source writer.
             writer = data_source.writer(schema, overwrite)  # type: ignore[assignment]
             if not isinstance(writer, DataSourceWriter):
                 raise PySparkAssertionError(
-                    error_class="DATA_SOURCE_TYPE_MISMATCH",
-                    message_parameters={
+                    errorClass="DATA_SOURCE_TYPE_MISMATCH",
+                    messageParameters={
                         "expected": "an instance of DataSourceWriter",
                         "actual": f"'{type(writer).__name__}'",
                     },
@@ -194,13 +219,18 @@ def main(infile: IO, outfile: IO) -> None:
                         ]
                         yield _create_row(fields=fields, values=values)
 
-            res = writer.write(batch_to_rows())
+            if isinstance(writer, DataSourceArrowWriter):
+                res = writer.write(iterator)
+            elif isinstance(writer, DataSourceStreamArrowWriter):
+                res = writer.write(iterator)  # type: ignore[arg-type]
+            else:
+                res = writer.write(batch_to_rows())
 
             # Check the commit message has the right type.
             if not isinstance(res, WriterCommitMessage):
                 raise PySparkRuntimeError(
-                    error_class="DATA_SOURCE_TYPE_MISMATCH",
-                    message_parameters={
+                    errorClass="DATA_SOURCE_TYPE_MISMATCH",
+                    messageParameters={
                         "expected": (
                             "'WriterCommitMessage' as the return type of " "the `write` method"
                         ),
@@ -225,6 +255,11 @@ def main(infile: IO, outfile: IO) -> None:
     except BaseException as e:
         handle_worker_exception(e, outfile)
         sys.exit(-1)
+    finally:
+        if faulthandler_log_path:
+            faulthandler.disable()
+            faulthandler_log_file.close()
+            os.remove(faulthandler_log_path)
 
     send_accumulator_updates(outfile)
 
@@ -236,12 +271,17 @@ def main(infile: IO, outfile: IO) -> None:
         write_int(SpecialLengths.END_OF_DATA_SECTION, outfile)
         sys.exit(-1)
 
+    # Force to cancel dump_traceback_later
+    faulthandler.cancel_dump_traceback_later()
+
 
 if __name__ == "__main__":
     # Read information about how to connect back to the JVM from the environment.
-    java_port = int(os.environ["PYTHON_WORKER_FACTORY_PORT"])
-    auth_secret = os.environ["PYTHON_WORKER_FACTORY_SECRET"]
-    (sock_file, _) = local_connect_and_auth(java_port, auth_secret)
+    conn_info = os.environ.get(
+        "PYTHON_WORKER_FACTORY_SOCK_PATH", int(os.environ.get("PYTHON_WORKER_FACTORY_PORT", -1))
+    )
+    auth_secret = os.environ.get("PYTHON_WORKER_FACTORY_SECRET")
+    (sock_file, _) = local_connect_and_auth(conn_info, auth_secret)
     write_int(os.getpid(), sock_file)
     sock_file.flush()
     main(sock_file, sock_file)

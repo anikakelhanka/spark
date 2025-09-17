@@ -33,7 +33,7 @@ import scala.reflect.classTag
 
 import com.esotericsoftware.kryo.KryoException
 import org.mockito.{ArgumentCaptor, ArgumentMatchers => mc}
-import org.mockito.Mockito.{doAnswer, mock, never, spy, times, verify, when}
+import org.mockito.Mockito.{atLeastOnce, doAnswer, mock, never, spy, times, verify, when}
 import org.scalatest.PrivateMethodTester
 import org.scalatest.concurrent.{Signaler, ThreadSignaler, TimeLimits}
 import org.scalatest.concurrent.Eventually._
@@ -66,6 +66,7 @@ import org.apache.spark.shuffle.sort.SortShuffleManager
 import org.apache.spark.storage.BlockManagerMessages._
 import org.apache.spark.util._
 import org.apache.spark.util.ArrayImplicits._
+import org.apache.spark.util.collection.Utils.createArray
 import org.apache.spark.util.io.ChunkedByteBuffer
 
 class BlockManagerSuite extends SparkFunSuite with Matchers with PrivateMethodTester
@@ -152,7 +153,7 @@ class BlockManagerSuite extends SparkFunSuite with Matchers with PrivateMethodTe
   }
 
   // Save modified system properties so that we can restore them after tests.
-  val originalArch = System.getProperty("os.arch")
+  val originalArch = Utils.osArch
   val originalCompressedOops = System.getProperty(TEST_USE_COMPRESSED_OOPS_KEY)
 
   def reinitializeSizeEstimator(arch: String, useCompressedOops: String): Unit = {
@@ -474,6 +475,26 @@ class BlockManagerSuite extends SparkFunSuite with Matchers with PrivateMethodTe
     assert(!BlockManagerId("notADriverIdentifier", "XXX", 1).isDriver)
   }
 
+  test("SPARK-43221: Host local block fetching should use a block status with disk size") {
+    conf.set(IO_ENCRYPTION_ENABLED, true)
+    conf.set(SHUFFLE_SERVICE_FETCH_RDD_ENABLED, true)
+    val store1 = makeBlockManager(2000, "exec1")
+    val store2 = makeBlockManager(2000, "exec2")
+    val store3 = makeBlockManager(2000, "exec3")
+    val store4 = makeBlockManager(2000, "exec4")
+    val value = new Array[Byte](100)
+    val broadcastId = BroadcastBlockId(0)
+    store1.putSingle(broadcastId, value, StorageLevel.MEMORY_ONLY, tellMaster = true)
+    store2.putSingle(broadcastId, value, StorageLevel.MEMORY_ONLY, tellMaster = true)
+    store3.putSingle(broadcastId, value, StorageLevel.DISK_ONLY, tellMaster = true)
+    store4.getRemoteBytes(broadcastId) match {
+      case Some(block) =>
+        assert(block.size > 0, "The block size must be greater than 0 for a nonempty block!")
+      case None =>
+        assert(false, "Block not found!")
+    }
+  }
+
   test("master + 1 manager interaction") {
     val store = makeBlockManager(20000)
     val a1 = new Array[Byte](4000)
@@ -698,7 +719,7 @@ class BlockManagerSuite extends SparkFunSuite with Matchers with PrivateMethodTe
       removedFromMemory: Boolean,
       removedFromDisk: Boolean): Unit = {
     def assertSizeReported(captor: ArgumentCaptor[Long], expectRemoved: Boolean): Unit = {
-      assert(captor.getAllValues().size() === 1)
+      assert(captor.getAllValues().size() >= 1)
       if (expectRemoved) {
         assert(captor.getValue() > 0)
       } else {
@@ -708,15 +729,18 @@ class BlockManagerSuite extends SparkFunSuite with Matchers with PrivateMethodTe
 
     val memSizeCaptor = ArgumentCaptor.forClass(classOf[Long]).asInstanceOf[ArgumentCaptor[Long]]
     val diskSizeCaptor = ArgumentCaptor.forClass(classOf[Long]).asInstanceOf[ArgumentCaptor[Long]]
-    verify(master).updateBlockInfo(mc.eq(store.blockManagerId), mc.eq(blockId),
-      mc.eq(StorageLevel.NONE), memSizeCaptor.capture(), diskSizeCaptor.capture())
+    val storageLevelCaptor =
+      ArgumentCaptor.forClass(classOf[StorageLevel]).asInstanceOf[ArgumentCaptor[StorageLevel]]
+    verify(master, atLeastOnce()).updateBlockInfo(mc.eq(store.blockManagerId), mc.eq(blockId),
+      storageLevelCaptor.capture(), memSizeCaptor.capture(), diskSizeCaptor.capture())
     assertSizeReported(memSizeCaptor, removedFromMemory)
     assertSizeReported(diskSizeCaptor, removedFromDisk)
+    assert(storageLevelCaptor.getValue.replication == 0)
   }
 
   private def assertUpdateBlockInfoNotReported(store: BlockManager, blockId: BlockId): Unit = {
     verify(master, never()).updateBlockInfo(mc.eq(store.blockManagerId), mc.eq(blockId),
-      mc.eq(StorageLevel.NONE), mc.anyInt(), mc.anyInt())
+      mc.any[StorageLevel](), mc.anyInt(), mc.anyInt())
   }
 
   test("reregistration on heart beat") {
@@ -848,8 +872,7 @@ class BlockManagerSuite extends SparkFunSuite with Matchers with PrivateMethodTe
     when(bmMaster.getLocations(mc.any[BlockId])).thenReturn(Seq(bmId1, bmId2, bmId3))
 
     val blockManager = makeBlockManager(128, "exec", bmMaster)
-    val sortLocations = PrivateMethod[Seq[BlockManagerId]](Symbol("sortLocations"))
-    val locations = blockManager invokePrivate sortLocations(bmMaster.getLocations("test"))
+    val locations = blockManager.sortLocations(bmMaster.getLocations("test"))
     assert(locations.map(_.host) === Seq(localHost, localHost, otherHost))
   }
 
@@ -871,8 +894,7 @@ class BlockManagerSuite extends SparkFunSuite with Matchers with PrivateMethodTe
     val blockManager = makeBlockManager(128, "exec", bmMaster)
     blockManager.blockManagerId =
       BlockManagerId(SparkContext.DRIVER_IDENTIFIER, localHost, 1, Some(localRack))
-    val sortLocations = PrivateMethod[Seq[BlockManagerId]](Symbol("sortLocations"))
-    val locations = blockManager invokePrivate sortLocations(bmMaster.getLocations("test"))
+    val locations = blockManager.sortLocations(bmMaster.getLocations("test"))
     assert(locations.map(_.host) === Seq(localHost, localHost, otherHost, otherHost, otherHost))
     assert(locations.flatMap(_.topologyInfo)
       === Seq(localRack, localRack, localRack, otherRack, otherRack))
@@ -916,7 +938,7 @@ class BlockManagerSuite extends SparkFunSuite with Matchers with PrivateMethodTe
       // the local disk of sameHostBm where the block is replicated to.
       // When there is no replication then block must be added via sameHostBm directly.
       val bmToPutBlock = if (storageLevel.replication > 1) otherHostBm else sameHostBm
-      val array = Array.fill(16)(Byte.MinValue to Byte.MaxValue).flatten
+      val array = createArray(16, Byte.MinValue to Byte.MaxValue).flatten
       val blockId = "list"
       bmToPutBlock.putIterator(blockId, List(array).iterator, storageLevel, tellMaster = true)
 
@@ -949,7 +971,7 @@ class BlockManagerSuite extends SparkFunSuite with Matchers with PrivateMethodTe
       val store2 = makeBlockManager(8000, "executor2", this.master,
         Some(new MockBlockTransferService(0)))
       val blockId = "list"
-      val array = Array.fill(16)(Byte.MinValue to Byte.MaxValue).flatten
+      val array = createArray(16, Byte.MinValue to Byte.MaxValue).flatten
       store2.putIterator(blockId, List(array).iterator, level, true)
       val expectedBlockData = store2.getLocalBytes(blockId)
       assert(expectedBlockData.isDefined)

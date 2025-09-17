@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.execution.datasources
 
+import java.io.IOException
 import java.util.Locale
 
 import scala.jdk.CollectionConverters._
@@ -53,6 +54,11 @@ object DataSourceUtils extends PredicateHelper {
   val PARTITION_OVERWRITE_MODE = "partitionOverwriteMode"
 
   /**
+   * The key to use for storing clusterBy columns as options.
+   */
+  val CLUSTERING_COLUMNS_KEY = "__clustering_columns"
+
+  /**
    * Utility methods for converting partitionBy columns to options and back.
    */
   private implicit val formats: Formats = Serialization.formats(NoTypeHints)
@@ -86,9 +92,14 @@ object DataSourceUtils extends PredicateHelper {
    * Verify if the schema is supported in datasource. This verification should be done
    * in a driver side.
    */
-  def verifySchema(format: FileFormat, schema: StructType): Unit = {
+  def verifySchema(format: FileFormat, schema: StructType, readOnly: Boolean = false): Unit = {
     schema.foreach { field =>
-      if (!format.supportDataType(field.dataType)) {
+      val supported = if (readOnly) {
+        format.supportReadDataType(field.dataType)
+      } else {
+        format.supportDataType(field.dataType)
+      }
+      if (!supported) {
         throw QueryCompilationErrors.dataTypeUnsupportedByDataSourceError(format.toString, field)
       }
     }
@@ -185,6 +196,11 @@ object DataSourceUtils extends PredicateHelper {
       case _ => throw SparkException.internalError(s"Unrecognized format $format.")
     }
     QueryExecutionErrors.sparkUpgradeInWritingDatesError(format, config)
+  }
+
+  def shouldIgnoreCorruptFileException(e: Throwable): Boolean = e match {
+    case _: RuntimeException | _: IOException | _: InternalError => true
+    case _ => false
   }
 
   def createDateRebaseFuncInRead(

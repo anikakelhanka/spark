@@ -42,7 +42,7 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.vectorized.ColumnarBatch
-import org.apache.spark.util.SerializableConfiguration
+import org.apache.spark.util.{SerializableConfiguration, Utils}
 
 /**
  * A factory used to create Parquet readers.
@@ -83,6 +83,8 @@ case class ParquetPartitionReaderFactory(
   private val pushDownInFilterThreshold = sqlConf.parquetFilterPushDownInFilterThreshold
   private val datetimeRebaseModeInRead = options.datetimeRebaseModeInRead
   private val int96RebaseModeInRead = options.int96RebaseModeInRead
+
+  private val parquetReaderCallback = new ParquetReaderCallback()
 
   private def getFooter(file: PartitionedFile): ParquetMetadata = {
     val conf = broadcastedConf.value.value
@@ -261,19 +263,24 @@ case class ParquetPartitionReaderFactory(
     val int96RebaseSpec = DataSourceUtils.int96RebaseSpec(
       footerFileMetaData.getKeyValueMetaData.get,
       int96RebaseModeInRead)
-    val reader = buildReaderFunc(
-      file.partitionValues,
-      pushed,
-      convertTz,
-      datetimeRebaseSpec,
-      int96RebaseSpec)
-    reader match {
-      case vectorizedReader: VectorizedParquetRecordReader =>
-        vectorizedReader.initialize(split, hadoopAttemptContext, Option.apply(fileFooter))
-      case _ =>
-        reader.initialize(split, hadoopAttemptContext)
+    Utils.createResourceUninterruptiblyIfInTaskThread {
+      Utils.tryInitializeResource(
+        buildReaderFunc(
+          file.partitionValues,
+          pushed,
+          convertTz,
+          datetimeRebaseSpec,
+          int96RebaseSpec)
+      ) { reader =>
+        reader match {
+          case vectorizedReader: VectorizedParquetRecordReader =>
+            vectorizedReader.initialize(split, hadoopAttemptContext, Option.apply(fileFooter))
+          case _ =>
+            reader.initialize(split, hadoopAttemptContext)
+        }
+        reader
+      }
     }
-    reader
   }
 
   private def createRowBaseReader(file: PartitionedFile): RecordReader[Void, InternalRow] = {
@@ -304,7 +311,8 @@ case class ParquetPartitionReaderFactory(
       reader, readDataSchema)
     val iter = new RecordReaderIterator(readerWithRowIndexes)
     // SPARK-23457 Register a task completion listener before `initialization`.
-    taskContext.foreach(_.addTaskCompletionListener[Unit](_ => iter.close()))
+    parquetReaderCallback.advanceFile(iter)
+    taskContext.foreach(parquetReaderCallback.initIfNotAlready)
     readerWithRowIndexes
   }
 
@@ -332,8 +340,39 @@ case class ParquetPartitionReaderFactory(
       capacity)
     val iter = new RecordReaderIterator(vectorizedReader)
     // SPARK-23457 Register a task completion listener before `initialization`.
-    taskContext.foreach(_.addTaskCompletionListener[Unit](_ => iter.close()))
+    parquetReaderCallback.advanceFile(iter)
+    taskContext.foreach(parquetReaderCallback.initIfNotAlready)
     logDebug(s"Appending $partitionSchema $partitionValues")
     vectorizedReader
+  }
+}
+
+/**
+ * A callback class to handle the cleanup of Parquet readers.
+ *
+ * This class is used to ensure that the Parquet readers are closed properly when the task
+ * completes, and it also allows for the initialization of the reader callback only once per task.
+ */
+private class ParquetReaderCallback extends Serializable {
+  private var init: Boolean = false
+  private var iter: RecordReaderIterator[_] = null
+
+  def initIfNotAlready(taskContext: TaskContext): Unit = {
+    if (!init) {
+      taskContext.addTaskCompletionListener[Unit](_ => closeCurrent())
+      init = true
+    }
+  }
+
+  def advanceFile(iter: RecordReaderIterator[_]): Unit = {
+    closeCurrent()
+
+    this.iter = iter
+  }
+
+  def closeCurrent(): Unit = {
+    if (iter != null) {
+      iter.close()
+    }
   }
 }

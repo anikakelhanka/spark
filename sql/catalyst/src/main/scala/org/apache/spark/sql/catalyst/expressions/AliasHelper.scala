@@ -20,6 +20,7 @@ package org.apache.spark.sql.catalyst.expressions
 import org.apache.spark.sql.catalyst.analysis.MultiAlias
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Project}
+import org.apache.spark.sql.catalyst.trees.CurrentOrigin
 import org.apache.spark.sql.types.Metadata
 
 /**
@@ -43,7 +44,7 @@ trait AliasHelper {
     AttributeMap(aliasMap)
   }
 
-  protected def getAliasMap(exprs: Seq[NamedExpression]): AttributeMap[Alias] = {
+  protected def getAliasMap(exprs: Iterable[NamedExpression]): AttributeMap[Alias] = {
     // Create a map of Aliases to their values from the child projection.
     // e.g., 'SELECT a + b AS c, d ...' produces Map(c -> Alias(a + b, c)).
     AttributeMap(exprs.collect { case a: Alias => (a.toAttribute, a) })
@@ -95,22 +96,22 @@ trait AliasHelper {
   }
 
   protected def trimNonTopLevelAliases[T <: Expression](e: T): T = {
-    val res = e match {
-      case a: Alias =>
-        val metadata = if (a.metadata == Metadata.empty) {
-          None
-        } else {
-          Some(a.metadata)
-        }
-        a.copy(child = trimAliases(a.child))(
-          exprId = a.exprId,
-          qualifier = a.qualifier,
-          explicitMetadata = metadata,
-          nonInheritableMetadataKeys = a.nonInheritableMetadataKeys)
-      case a: MultiAlias =>
-        a.copy(child = trimAliases(a.child))
-      case other => trimAliases(other)
+    val res = CurrentOrigin.withOrigin(e.origin) {
+      e match {
+        case a: Alias =>
+          // Preserve the _effective_ metadata.
+          a.copy(child = trimAliases(a.child))(
+            exprId = a.exprId,
+            qualifier = a.qualifier,
+            explicitMetadata = Some(a.metadata),
+            nonInheritableMetadataKeys = Nil)
+        case a: MultiAlias =>
+          a.copy(child = trimAliases(a.child))
+        case other => trimAliases(other)
+      }
     }
+
+    res.copyTagsFrom(e)
 
     res.asInstanceOf[T]
   }

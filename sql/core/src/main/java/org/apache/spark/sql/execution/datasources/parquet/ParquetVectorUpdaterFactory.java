@@ -24,6 +24,7 @@ import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.LogicalTypeAnnotation.IntLogicalTypeAnnotation;
 import org.apache.parquet.schema.LogicalTypeAnnotation.DateLogicalTypeAnnotation;
 import org.apache.parquet.schema.LogicalTypeAnnotation.DecimalLogicalTypeAnnotation;
+import org.apache.parquet.schema.LogicalTypeAnnotation.TimeLogicalTypeAnnotation;
 import org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation;
 import org.apache.parquet.schema.PrimitiveType;
 
@@ -158,6 +159,8 @@ public class ParquetVectorUpdaterFactory {
           return new LongUpdater();
         } else if (canReadAsDecimal(descriptor, sparkType)) {
           return new LongToDecimalUpdater(descriptor, (DecimalType) sparkType);
+        } else if (sparkType instanceof TimeType) {
+          return new LongAsNanosUpdater();
         }
       }
       case FLOAT -> {
@@ -228,6 +231,11 @@ public class ParquetVectorUpdaterFactory {
 
   boolean isTimestampTypeMatched(LogicalTypeAnnotation.TimeUnit unit) {
     return logicalTypeAnnotation instanceof TimestampLogicalTypeAnnotation annotation &&
+      annotation.getUnit() == unit;
+  }
+
+  boolean isTimeTypeMatched(LogicalTypeAnnotation.TimeUnit unit) {
+    return logicalTypeAnnotation instanceof TimeLogicalTypeAnnotation annotation &&
       annotation.getUnit() == unit;
   }
 
@@ -823,6 +831,42 @@ public class ParquetVectorUpdaterFactory {
     }
   }
 
+  private static class LongAsNanosUpdater implements ParquetVectorUpdater {
+    @Override
+    public void readValues(
+        int total,
+        int offset,
+        WritableColumnVector values,
+        VectorizedValuesReader valuesReader) {
+      for (int i = 0; i < total; ++i) {
+        readValue(offset + i, values, valuesReader);
+      }
+    }
+
+    @Override
+    public void skipValues(int total, VectorizedValuesReader valuesReader) {
+      valuesReader.skipLongs(total);
+    }
+
+    @Override
+    public void readValue(
+        int offset,
+        WritableColumnVector values,
+        VectorizedValuesReader valuesReader) {
+      values.putLong(offset, DateTimeUtils.microsToNanos(valuesReader.readLong()));
+    }
+
+    @Override
+    public void decodeSingleDictionaryId(
+        int offset,
+        WritableColumnVector values,
+        WritableColumnVector dictionaryIds,
+        Dictionary dictionary) {
+      long micros = dictionary.decodeToLong(dictionaryIds.getDictId(offset));
+      values.putLong(offset, DateTimeUtils.microsToNanos(micros));
+    }
+  }
+
   private static class FloatUpdater implements ParquetVectorUpdater {
     @Override
     public void readValues(
@@ -954,7 +998,7 @@ public class ParquetVectorUpdaterFactory {
         WritableColumnVector dictionaryIds,
         Dictionary dictionary) {
       Binary v = dictionary.decodeToBinary(dictionaryIds.getDictId(offset));
-      values.putByteArray(offset, v.getBytes());
+      values.putByteArray(offset, v.getBytesUnsafe());
     }
   }
 
@@ -1264,7 +1308,7 @@ public class ParquetVectorUpdaterFactory {
         WritableColumnVector dictionaryIds,
         Dictionary dictionary) {
       Binary v = dictionary.decodeToBinary(dictionaryIds.getDictId(offset));
-      values.putByteArray(offset, v.getBytes());
+      values.putByteArray(offset, v.getBytesUnsafe());
     }
   }
 
@@ -1498,7 +1542,7 @@ private static class BinaryToDecimalUpdater extends DecimalUpdater {
         WritableColumnVector dictionaryIds,
         Dictionary dictionary) {
       BigInteger value =
-        new BigInteger(dictionary.decodeToBinary(dictionaryIds.getDictId(offset)).getBytes());
+        new BigInteger(dictionary.decodeToBinary(dictionaryIds.getDictId(offset)).getBytesUnsafe());
       BigDecimal decimal = new BigDecimal(value, parquetScale);
       writeDecimal(offset, values, decimal);
     }
@@ -1526,7 +1570,7 @@ private static class FixedLenByteArrayToDecimalUpdater extends DecimalUpdater {
         int offset,
         WritableColumnVector values,
         VectorizedValuesReader valuesReader) {
-      BigInteger value = new BigInteger(valuesReader.readBinary(arrayLen).getBytes());
+      BigInteger value = new BigInteger(valuesReader.readBinary(arrayLen).getBytesUnsafe());
       BigDecimal decimal = new BigDecimal(value, this.parquetScale);
       writeDecimal(offset, values, decimal);
     }
@@ -1538,7 +1582,7 @@ private static class FixedLenByteArrayToDecimalUpdater extends DecimalUpdater {
         WritableColumnVector dictionaryIds,
         Dictionary dictionary) {
       BigInteger value =
-        new BigInteger(dictionary.decodeToBinary(dictionaryIds.getDictId(offset)).getBytes());
+        new BigInteger(dictionary.decodeToBinary(dictionaryIds.getDictId(offset)).getBytesUnsafe());
       BigDecimal decimal = new BigDecimal(value, this.parquetScale);
       writeDecimal(offset, values, decimal);
     }

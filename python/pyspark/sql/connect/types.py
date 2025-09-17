@@ -29,6 +29,7 @@ from pyspark.sql.types import (
     IntegerType,
     FloatType,
     DateType,
+    TimeType,
     TimestampType,
     TimestampNTZType,
     DayTimeIntervalType,
@@ -101,26 +102,26 @@ class UnparsedDataType(DataType):
 
     def jsonValue(self) -> Dict[str, Any]:
         raise PySparkAssertionError(
-            error_class="INVALID_CALL_ON_UNRESOLVED_OBJECT",
-            message_parameters={"func_name": "jsonValue"},
+            errorClass="INVALID_CALL_ON_UNRESOLVED_OBJECT",
+            messageParameters={"func_name": "jsonValue"},
         )
 
     def needConversion(self) -> bool:
         raise PySparkAssertionError(
-            error_class="INVALID_CALL_ON_UNRESOLVED_OBJECT",
-            message_parameters={"func_name": "needConversion"},
+            errorClass="INVALID_CALL_ON_UNRESOLVED_OBJECT",
+            messageParameters={"func_name": "needConversion"},
         )
 
     def toInternal(self, obj: Any) -> Any:
         raise PySparkAssertionError(
-            error_class="INVALID_CALL_ON_UNRESOLVED_OBJECT",
-            message_parameters={"func_name": "toInternal"},
+            errorClass="INVALID_CALL_ON_UNRESOLVED_OBJECT",
+            messageParameters={"func_name": "toInternal"},
         )
 
     def fromInternal(self, obj: Any) -> Any:
         raise PySparkAssertionError(
-            error_class="INVALID_CALL_ON_UNRESOLVED_OBJECT",
-            message_parameters={"func_name": "fromInternal"},
+            errorClass="INVALID_CALL_ON_UNRESOLVED_OBJECT",
+            messageParameters={"func_name": "fromInternal"},
         )
 
 
@@ -128,6 +129,10 @@ def pyspark_types_to_proto_types(data_type: DataType) -> pb2.DataType:
     ret = pb2.DataType()
     if isinstance(data_type, NullType):
         ret.null.CopyFrom(pb2.DataType.NULL())
+    elif isinstance(data_type, CharType):
+        ret.char.length = data_type.length
+    elif isinstance(data_type, VarcharType):
+        ret.var_char.length = data_type.length
     elif isinstance(data_type, StringType):
         ret.string.collation = data_type.collation
     elif isinstance(data_type, BooleanType):
@@ -151,6 +156,8 @@ def pyspark_types_to_proto_types(data_type: DataType) -> pb2.DataType:
         ret.decimal.precision = data_type.precision
     elif isinstance(data_type, DateType):
         ret.date.CopyFrom(pb2.DataType.Date())
+    elif isinstance(data_type, TimeType):
+        ret.time.precision = data_type.precision
     elif isinstance(data_type, TimestampType):
         ret.timestamp.CopyFrom(pb2.DataType.Timestamp())
     elif isinstance(data_type, TimestampNTZType):
@@ -199,8 +206,8 @@ def pyspark_types_to_proto_types(data_type: DataType) -> pb2.DataType:
         ret.unparsed.data_type_string = data_type_string
     else:
         raise PySparkValueError(
-            error_class="UNSUPPORTED_OPERATION",
-            message_parameters={"operation": f"data type {data_type}"},
+            errorClass="UNSUPPORTED_OPERATION",
+            messageParameters={"operation": f"data type {data_type}"},
         )
     return ret
 
@@ -237,6 +244,8 @@ def proto_schema_to_pyspark_data_type(schema: pb2.DataType) -> DataType:
         return VarcharType(schema.var_char.length)
     elif schema.HasField("date"):
         return DateType()
+    elif schema.HasField("time"):
+        return TimeType(schema.time.precision) if schema.time.HasField("precision") else TimeType()
     elif schema.HasField("timestamp"):
         return TimestampType()
     elif schema.HasField("timestamp_ntz"):
@@ -303,8 +312,8 @@ def proto_schema_to_pyspark_data_type(schema: pb2.DataType) -> DataType:
         return UserDefinedType.fromJson(json_value)
     else:
         raise PySparkValueError(
-            error_class="UNSUPPORTED_OPERATION",
-            message_parameters={"operation": f"data type {schema}"},
+            errorClass="UNSUPPORTED_OPERATION",
+            messageParameters={"operation": f"data type {schema}"},
         )
 
 

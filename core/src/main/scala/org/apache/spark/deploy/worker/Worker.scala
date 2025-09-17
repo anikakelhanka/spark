@@ -37,7 +37,7 @@ import org.apache.spark.deploy.ExternalShuffleService
 import org.apache.spark.deploy.StandaloneResourceUtils._
 import org.apache.spark.deploy.master.{DriverState, Master}
 import org.apache.spark.deploy.worker.ui.WorkerWebUI
-import org.apache.spark.internal.{config, Logging, MDC}
+import org.apache.spark.internal.{config, Logging}
 import org.apache.spark.internal.LogKeys._
 import org.apache.spark.internal.config.Tests.IS_TESTING
 import org.apache.spark.internal.config.UI._
@@ -600,7 +600,7 @@ private[deploy] class Worker(
 
           // Create the executor's working directory
           val executorDir = new File(workDir, appId + "/" + execId)
-          if (!executorDir.mkdirs()) {
+          if (!Utils.createDirectory(executorDir)) {
             throw new IOException("Failed to create directory " + executorDir)
           }
 
@@ -980,6 +980,7 @@ private[deploy] object Worker extends Logging {
   def main(argStrings: Array[String]): Unit = {
     Thread.setDefaultUncaughtExceptionHandler(new SparkUncaughtExceptionHandler(
       exitOnUncaughtException = false))
+    Utils.resetStructuredLogging()
     Utils.initDaemon(log)
     val conf = new SparkConf
     val args = new WorkerArguments(argStrings, conf)

@@ -17,21 +17,24 @@
 package org.apache.spark.sql.execution.datasources.v2.state
 
 import java.io.{File, FileWriter}
+import java.nio.ByteOrder
+import java.util.UUID
 
 import org.apache.hadoop.conf.Configuration
 import org.scalatest.Assertions
 
-import org.apache.spark.{SparkException, SparkUnsupportedOperationException}
+import org.apache.spark.{SparkException, SparkThrowable, SparkUnsupportedOperationException}
 import org.apache.spark.io.CompressionCodec
 import org.apache.spark.sql.{AnalysisException, DataFrame, Encoders, Row}
 import org.apache.spark.sql.catalyst.expressions.{BoundReference, GenericInternalRow}
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.execution.datasources.v2.state.utils.SchemaUtil
-import org.apache.spark.sql.execution.streaming.{CommitLog, MemoryStream, OffsetSeqLog}
+import org.apache.spark.sql.execution.streaming.checkpointing.{CommitLog, OffsetSeqLog}
+import org.apache.spark.sql.execution.streaming.runtime.{MemoryStream, StreamExecution}
 import org.apache.spark.sql.execution.streaming.state._
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.streaming.OutputMode
+import org.apache.spark.sql.streaming.{OutputMode, TimeMode, TransformWithStateSuiteUtils}
 import org.apache.spark.sql.types.{IntegerType, StructType}
 
 class StateDataSourceNegativeTestSuite extends StateDataSourceTestBase {
@@ -268,6 +271,63 @@ class StateDataSourceNegativeTestSuite extends StateDataSourceTestBase {
           "message" -> s"value should be less than or equal to $endBatchId"))
     }
   }
+
+  test("ERROR: trying to specify state variable name with " +
+    "non-transformWithState operator") {
+    withTempDir { tempDir =>
+      runDropDuplicatesQuery(tempDir.getAbsolutePath)
+
+      val exc = intercept[StateDataSourceInvalidOptionValue] {
+        spark.read.format("statestore")
+          // trick to bypass getting the last committed batch before validating operator ID
+          .option(StateSourceOptions.BATCH_ID, 0)
+          .option(StateSourceOptions.STATE_VAR_NAME, "test")
+          .load(tempDir.getAbsolutePath)
+      }
+      checkError(exc, "STDS_INVALID_OPTION_VALUE.WITH_MESSAGE", Some("42616"),
+        Map("optionName" -> StateSourceOptions.STATE_VAR_NAME,
+          "message" -> ".*"),
+        matchPVals = true)
+    }
+  }
+
+  test("ERROR: trying to specify state variable name along with " +
+    "readRegisteredTimers should fail") {
+    withTempDir { tempDir =>
+      val exc = intercept[StateDataSourceConflictOptions] {
+        spark.read.format("statestore")
+          // trick to bypass getting the last committed batch before validating operator ID
+          .option(StateSourceOptions.BATCH_ID, 0)
+          .option(StateSourceOptions.STATE_VAR_NAME, "test")
+          .option(StateSourceOptions.READ_REGISTERED_TIMERS, true)
+          .load(tempDir.getAbsolutePath)
+      }
+      checkError(exc, "STDS_CONFLICT_OPTIONS", "42613",
+        Map("options" ->
+          s"['${
+            StateSourceOptions.READ_REGISTERED_TIMERS
+          }', '${StateSourceOptions.STATE_VAR_NAME}']"))
+    }
+  }
+
+  test("ERROR: trying to specify non boolean value for " +
+    "flattenCollectionTypes") {
+    withTempDir { tempDir =>
+      runDropDuplicatesQuery(tempDir.getAbsolutePath)
+
+      val exc = intercept[StateDataSourceInvalidOptionValue] {
+        spark.read.format("statestore")
+          // trick to bypass getting the last committed batch before validating operator ID
+          .option(StateSourceOptions.BATCH_ID, 0)
+          .option(StateSourceOptions.FLATTEN_COLLECTION_TYPES, "test")
+          .load(tempDir.getAbsolutePath)
+      }
+      checkError(exc, "STDS_INVALID_OPTION_VALUE.WITH_MESSAGE", Some("42616"),
+        Map("optionName" -> StateSourceOptions.FLATTEN_COLLECTION_TYPES,
+          "message" -> ".*"),
+        matchPVals = true)
+    }
+  }
 }
 
 /**
@@ -400,19 +460,19 @@ class HDFSBackedStateDataSourceReadSuite extends StateDataSourceReadSuite {
     testSnapshotPartitionId()
   }
 
-  test("snapshotStatBatchId on limit state") {
+  test("snapshotStartBatchId on limit state") {
     testSnapshotOnLimitState("hdfs")
   }
 
-  test("snapshotStatBatchId on aggregation state") {
+  test("snapshotStartBatchId on aggregation state") {
     testSnapshotOnAggregateState("hdfs")
   }
 
-  test("snapshotStatBatchId on deduplication state") {
+  test("snapshotStartBatchId on deduplication state") {
     testSnapshotOnDeduplicateState("hdfs")
   }
 
-  test("snapshotStatBatchId on join state") {
+  test("snapshotStartBatchId on join state") {
     testSnapshotOnJoinState("hdfs", 1)
     testSnapshotOnJoinState("hdfs", 2)
   }
@@ -428,6 +488,40 @@ class RocksDBStateDataSourceReadSuite extends StateDataSourceReadSuite {
       newStateStoreProvider().getClass.getName)
     spark.conf.set("spark.sql.streaming.stateStore.rocksdb.changelogCheckpointing.enabled",
       "false")
+  }
+
+  test("ERROR: Do not provide state variable name with " +
+    "transformWithState operator") {
+    import testImplicits._
+    withTempDir { tempDir =>
+      withSQLConf(SQLConf.STATE_STORE_PROVIDER_CLASS.key ->
+        classOf[RocksDBStateStoreProvider].getName,
+        SQLConf.SHUFFLE_PARTITIONS.key ->
+          TransformWithStateSuiteUtils.NUM_SHUFFLE_PARTITIONS.toString) {
+        val inputData = MemoryStream[String]
+        val result = inputData.toDS()
+          .groupByKey(x => x)
+          .transformWithState(new StatefulProcessorWithSingleValueVar(),
+            TimeMode.None(),
+            OutputMode.Update())
+
+        testStream(result, OutputMode.Update())(
+          StartStream(checkpointLocation = tempDir.getAbsolutePath),
+          AddData(inputData, "a"),
+          CheckNewAnswer(("a", "1")),
+          StopStream
+        )
+
+        val e = intercept[StateDataSourceUnspecifiedRequiredOption] {
+          spark.read
+            .format("statestore")
+            .option(StateSourceOptions.PATH, tempDir.getAbsolutePath)
+            .load()
+        }
+        checkError(e, "STDS_REQUIRED_OPTION_UNSPECIFIED", Some("42601"),
+          Map("optionName" -> "stateVarName"))
+      }
+    }
   }
 }
 
@@ -459,21 +553,129 @@ StateDataSourceReadSuite {
     testSnapshotPartitionId()
   }
 
-  test("snapshotStatBatchId on limit state") {
+  test("snapshotStartBatchId on limit state") {
     testSnapshotOnLimitState("rocksdb")
   }
 
-  test("snapshotStatBatchId on aggregation state") {
+  test("snapshotStartBatchId on aggregation state") {
     testSnapshotOnAggregateState("rocksdb")
   }
 
-  test("snapshotStatBatchId on deduplication state") {
+  test("snapshotStartBatchId on deduplication state") {
     testSnapshotOnDeduplicateState("rocksdb")
   }
 
-  test("snapshotStatBatchId on join state") {
+  test("snapshotStartBatchId on join state") {
     testSnapshotOnJoinState("rocksdb", 1)
     testSnapshotOnJoinState("rocksdb", 2)
+  }
+
+  /**
+   * Note that we cannot use the golden files approach for transformWithState. The new schema
+   * format keeps track of the schema file path as an absolute path which cannot be used with
+   * the getResource model used in other similar tests on runbot.
+   */
+  test("snapshotStartBatchId on join state v3") {
+    testSnapshotOnJoinStateV3()
+  }
+}
+
+class RocksDBWithCheckpointV2StateDataSourceReaderSuite extends StateDataSourceReadSuite {
+  override protected def newStateStoreProvider(): RocksDBStateStoreProvider =
+    new RocksDBStateStoreProvider
+
+  import testImplicits._
+
+  override def beforeAll(): Unit = {
+    super.beforeAll()
+    spark.conf.set(SQLConf.STATE_STORE_CHECKPOINT_FORMAT_VERSION, 2)
+    spark.conf.set(SQLConf.STATE_STORE_PROVIDER_CLASS.key,
+      newStateStoreProvider().getClass.getName)
+    spark.conf.set("spark.sql.streaming.stateStore.rocksdb.changelogCheckpointing.enabled",
+      "true")
+  }
+
+  // TODO: Remove this test once we allow migrations from checkpoint v1 to v2
+  test("reading checkpoint v2 store with version 1 should fail") {
+    withTempDir { tmpDir =>
+      val inputData = MemoryStream[(Int, Long)]
+      val query = getStreamStreamJoinQuery(inputData)
+      testStream(query)(
+        StartStream(checkpointLocation = tmpDir.getCanonicalPath),
+        AddData(inputData, (1, 1L), (2, 2L), (3, 3L), (4, 4L), (5, 5L)),
+        ProcessAllAvailable(),
+        Execute { _ => Thread.sleep(2000) },
+        StopStream
+      )
+
+      withSQLConf(SQLConf.STATE_STORE_CHECKPOINT_FORMAT_VERSION.key -> "1") {
+        // Verify reading state throws error when reading checkpoint v2 with version 1
+        val exc = intercept[IllegalStateException] {
+          val stateDf = spark.read.format("statestore")
+            .option(StateSourceOptions.BATCH_ID, 0)
+            .option(StateSourceOptions.OPERATOR_ID, 0)
+            .load(tmpDir.getCanonicalPath)
+          stateDf.collect()
+        }
+
+        checkError(exc.getCause.asInstanceOf[SparkThrowable],
+          "INVALID_LOG_VERSION.EXACT_MATCH_VERSION", "KD002",
+          Map(
+            "version" -> "2",
+            "matchVersion" -> "1"))
+      }
+    }
+  }
+}
+
+class RocksDBWithCheckpointV2StateDataSourceReaderSnapshotSuite extends StateDataSourceReadSuite {
+  override protected def newStateStoreProvider(): RocksDBStateStoreProvider =
+    new RocksDBStateStoreProvider
+
+  override def beforeAll(): Unit = {
+    super.beforeAll()
+    spark.conf.set(SQLConf.STATE_STORE_CHECKPOINT_FORMAT_VERSION, 2)
+    spark.conf.set(SQLConf.STATE_STORE_PROVIDER_CLASS.key,
+      newStateStoreProvider().getClass.getName)
+    spark.conf.set("spark.sql.streaming.stateStore.rocksdb.changelogCheckpointing.enabled",
+      "true")
+    // make sure we have a snapshot for every two delta files
+    // HDFS maintenance task will not count the latest delta file, which has the same version
+    // as the snapshot version
+    spark.conf.set(SQLConf.STATE_STORE_MIN_DELTAS_FOR_SNAPSHOT.key, 2)
+  }
+
+  test("ERROR: snapshot of version not found") {
+    testSnapshotNotFound()
+  }
+
+  test("provider.getReadStore(snapshotVersion, endVersion)") {
+    testGetReadStoreWithStartVersion()
+  }
+
+  test("option snapshotPartitionId") {
+    testSnapshotPartitionId()
+  }
+
+  test("snapshotStartBatchId on limit state") {
+    testSnapshotOnLimitState("rocksdb", checkpointFormatVersion = 2)
+  }
+
+  test("snapshotStartBatchId on aggregation state") {
+    testSnapshotOnAggregateState("rocksdb", checkpointFormatVersion = 2)
+  }
+
+  test("snapshotStartBatchId on deduplication state") {
+    testSnapshotOnDeduplicateState("rocksdb", checkpointFormatVersion = 2)
+  }
+
+  test("snapshotStartBatchId on join state") {
+    testSnapshotOnJoinState("rocksdb", 1, checkpointFormatVersion = 2)
+    testSnapshotOnJoinState("rocksdb", 2, checkpointFormatVersion = 2)
+  }
+
+  test("snapshotStartBatchId on join state v3") {
+    testSnapshotOnJoinStateV3()
   }
 }
 
@@ -496,6 +698,8 @@ abstract class StateDataSourceReadSuite extends StateDataSourceTestBase with Ass
    */
   private def getNewStateStoreProvider(checkpointDir: String): StateStoreProvider = {
     val provider = newStateStoreProvider()
+    val conf = new Configuration()
+    conf.set(StreamExecution.RUN_ID_KEY, UUID.randomUUID().toString)
     provider.init(
       StateStoreId(checkpointDir, 0, 0),
       keySchema,
@@ -503,7 +707,7 @@ abstract class StateDataSourceReadSuite extends StateDataSourceTestBase with Ass
       NoPrefixKeyStateEncoderSpec(keySchema),
       useColumnFamilies = false,
       StateStoreConf(spark.sessionState.conf),
-      new Configuration)
+      conf)
     provider
   }
 
@@ -703,6 +907,11 @@ abstract class StateDataSourceReadSuite extends StateDataSourceTestBase with Ass
   }
 
   test("flatMapGroupsWithState, state ver 1") {
+    // Skip this test on big endian platforms because the timestampTimeoutAttribute of
+    // StateManagerImplV1 is declared as IntegerType instead of LongType which breaks
+    // serialization on big endian. This can't be fixed because it would be a breaking
+    // schema change.
+    assume(ByteOrder.nativeOrder().equals(ByteOrder.LITTLE_ENDIAN))
     testFlatMapGroupsWithState(1)
   }
 
@@ -769,6 +978,10 @@ abstract class StateDataSourceReadSuite extends StateDataSourceTestBase with Ass
     testStreamStreamJoin(2)
   }
 
+  test("stream-stream join, state ver 3") {
+    testStreamStreamJoin(3)
+  }
+
   private def testStreamStreamJoin(stateVersion: Int): Unit = {
     def assertInternalColumnIsNotExposed(df: DataFrame): Unit = {
       val valueSchema = SchemaUtil.getSchemaAsDataType(df.schema, "value")
@@ -777,6 +990,12 @@ abstract class StateDataSourceReadSuite extends StateDataSourceTestBase with Ass
       intercept[AnalysisException] {
         SchemaUtil.getSchemaAsDataType(valueSchema, "matched")
       }
+    }
+
+    // We should only test state version 3 with RocksDBStateStoreProvider
+    if (stateVersion == 3
+      && SQLConf.get.stateStoreProviderClass != classOf[RocksDBStateStoreProvider].getName) {
+      return
     }
 
     withSQLConf(SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key -> stateVersion.toString) {
@@ -839,7 +1058,7 @@ abstract class StateDataSourceReadSuite extends StateDataSourceTestBase with Ass
 
         val stateReadDfForRightKeyWithIndexToValue = stateReaderForRightKeyWithIndexToValue.load()
 
-        if (stateVersion == 2) {
+        if (stateVersion >= 2) {
           val resultDf4 = stateReadDfForRightKeyWithIndexToValue
             .selectExpr("key.field0 AS key_0", "key.index AS key_index",
               "value.rightId AS rightId", "CAST(value.rightTime AS integer) AS rightTime",
@@ -889,7 +1108,7 @@ abstract class StateDataSourceReadSuite extends StateDataSourceTestBase with Ass
         // skip version and operator ID to test out functionalities
         .load()
 
-      val numShufflePartitions = spark.conf.get(SQLConf.SHUFFLE_PARTITIONS)
+      val numShufflePartitions = sqlConf.getConf(SQLConf.SHUFFLE_PARTITIONS)
 
       val resultDf = stateReadDf
         .selectExpr("key.value AS key_value", "value.count AS value_count", "partition_id")
@@ -913,7 +1132,7 @@ abstract class StateDataSourceReadSuite extends StateDataSourceTestBase with Ass
   }
 
   test("partition_id column with stream-stream join") {
-    val numShufflePartitions = spark.conf.get(SQLConf.SHUFFLE_PARTITIONS)
+    val numShufflePartitions = sqlConf.getConf(SQLConf.SHUFFLE_PARTITIONS)
 
     withTempDir { tempDir =>
       runStreamStreamJoinQueryWithOneThousandInputs(tempDir.getAbsolutePath)
@@ -994,22 +1213,29 @@ abstract class StateDataSourceReadSuite extends StateDataSourceTestBase with Ass
 
   protected def testGetReadStoreWithStartVersion(): Unit = {
     withTempDir { tempDir =>
+      val versionToCkptId = scala.collection.mutable.Map[Long, Option[String]]()
       val provider = getNewStateStoreProvider(tempDir.getAbsolutePath)
       for (i <- 1 to 4) {
-        val store = provider.getStore(i - 1)
+        val store = provider.getStore(i - 1, versionToCkptId.getOrElse(i - 1, None))
         put(store, "a", i, i)
         store.commit()
+
+        val ssInfo = store.getStateStoreCheckpointInfo()
+        versionToCkptId(ssInfo.batchVersion) = ssInfo.stateStoreCkptId
+
         provider.doMaintenance()
       }
 
       val result =
         provider.asInstanceOf[SupportsFineGrainedReplay]
-          .replayReadStateFromSnapshot(2, 3)
+          .replayReadStateFromSnapshot(2, 3,
+            versionToCkptId.getOrElse(2, None), versionToCkptId.getOrElse(3, None))
 
       assert(get(result, "a", 1).get == 1)
       assert(get(result, "a", 2).get == 2)
       assert(get(result, "a", 3).get == 3)
       assert(get(result, "a", 4).isEmpty)
+      result.release()
 
       provider.close()
     }
@@ -1046,7 +1272,7 @@ abstract class StateDataSourceReadSuite extends StateDataSourceTestBase with Ass
       val exc = intercept[StateStoreSnapshotPartitionNotFound] {
         stateDfError.show()
       }
-      assert(exc.getErrorClass === "CANNOT_LOAD_STATE_STORE.SNAPSHOT_PARTITION_ID_NOT_FOUND")
+      assert(exc.getCondition === "CANNOT_LOAD_STATE_STORE.SNAPSHOT_PARTITION_ID_NOT_FOUND")
     }
   }
 
@@ -1063,10 +1289,13 @@ abstract class StateDataSourceReadSuite extends StateDataSourceTestBase with Ass
     checkAnswer(stateSnapshotDf, stateDf)
   }
 
-  protected def testSnapshotOnLimitState(providerName: String): Unit = {
+  protected def testSnapshotOnLimitState(
+      providerName: String,
+      checkpointFormatVersion: Int = 1): Unit = {
     /** The golden files are generated by:
       withSQLConf({
         SQLConf.STREAMING_MAINTENANCE_INTERVAL.key -> "100"
+        SQLConf.STATE_STORE_CHECKPOINT_FORMAT_VERSION.key -> checkpointFormatVersion.toString
       }) {
         val inputData = MemoryStream[(Int, Long)]
         val query = inputData.toDF().limit(10)
@@ -1087,17 +1316,27 @@ abstract class StateDataSourceReadSuite extends StateDataSourceTestBase with Ass
         )
       }
      */
+
+    val versionSuffix = if (checkpointFormatVersion == 2) {
+      "-checkpoint-v2"
+    } else {
+      ""
+    }
+
     val resourceUri = this.getClass.getResource(
-      s"/structured-streaming/checkpoint-version-4.0.0/$providerName/limit/"
+      s"/structured-streaming/checkpoint-version-4.0.0$versionSuffix/$providerName/limit/"
     ).toURI
 
     testSnapshotStateDfAgainstStateDf(new File(resourceUri))
   }
 
-  protected def testSnapshotOnAggregateState(providerName: String): Unit = {
+  protected def testSnapshotOnAggregateState(
+      providerName: String,
+      checkpointFormatVersion: Int = 1): Unit = {
     /** The golden files are generated by:
       withSQLConf({
         SQLConf.STREAMING_MAINTENANCE_INTERVAL.key -> "100"
+        SQLConf.STATE_STORE_CHECKPOINT_FORMAT_VERSION.key -> checkpointFormatVersion.toString
       }) {
         val inputData = MemoryStream[(Int, Long)]
         val query = inputData.toDF().groupBy("_1").count()
@@ -1118,17 +1357,26 @@ abstract class StateDataSourceReadSuite extends StateDataSourceTestBase with Ass
         )
       }
      */
+    val versionSuffix = if (checkpointFormatVersion == 2) {
+      "-checkpoint-v2"
+    } else {
+      ""
+    }
+
     val resourceUri = this.getClass.getResource(
-      s"/structured-streaming/checkpoint-version-4.0.0/$providerName/dedup/"
+      s"/structured-streaming/checkpoint-version-4.0.0$versionSuffix/$providerName/dedup/"
     ).toURI
 
     testSnapshotStateDfAgainstStateDf(new File(resourceUri))
   }
 
-  protected def testSnapshotOnDeduplicateState(providerName: String): Unit = {
+  protected def testSnapshotOnDeduplicateState(
+      providerName: String,
+      checkpointFormatVersion: Int = 1): Unit = {
     /** The golden files are generated by:
       withSQLConf({
         SQLConf.STREAMING_MAINTENANCE_INTERVAL.key -> "100"
+        SQLConf.STATE_STORE_CHECKPOINT_FORMAT_VERSION.key -> checkpointFormatVersion.toString
       }) {
         val inputData = MemoryStream[(Int, Long)]
         val query = inputData.toDF().dropDuplicates("_1")
@@ -1149,18 +1397,28 @@ abstract class StateDataSourceReadSuite extends StateDataSourceTestBase with Ass
         )
       }
      */
+    val versionSuffix = if (checkpointFormatVersion == 2) {
+      "-checkpoint-v2"
+    } else {
+      ""
+    }
+
     val resourceUri = this.getClass.getResource(
-      s"/structured-streaming/checkpoint-version-4.0.0/$providerName/dedup/"
+      s"/structured-streaming/checkpoint-version-4.0.0$versionSuffix/$providerName/dedup/"
     ).toURI
 
     testSnapshotStateDfAgainstStateDf(new File(resourceUri))
   }
 
-  protected def testSnapshotOnJoinState(providerName: String, stateVersion: Int): Unit = {
+  protected def testSnapshotOnJoinState(
+      providerName: String,
+      stateVersion: Int,
+      checkpointFormatVersion: Int = 1): Unit = {
     /** The golden files are generated by:
       withSQLConf({
         SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key -> stateVersion.toString
         SQLConf.STREAMING_MAINTENANCE_INTERVAL.key -> "100"
+        SQLConf.STATE_STORE_CHECKPOINT_FORMAT_VERSION.key -> checkpointFormatVersion.toString
       }) {
         val inputData = MemoryStream[(Int, Long)]
         val query = getStreamStreamJoinQuery(inputData)
@@ -1178,8 +1436,15 @@ abstract class StateDataSourceReadSuite extends StateDataSourceTestBase with Ass
         )
       }
      */
+    val versionSuffix = if (checkpointFormatVersion == 2) {
+      "-checkpoint-v2"
+    } else {
+      ""
+    }
+
     val resourceUri = this.getClass.getResource(
-      s"/structured-streaming/checkpoint-version-4.0.0/$providerName/join$stateVersion/"
+      s"/structured-streaming/checkpoint-version-4.0.0$versionSuffix/" +
+        s"$providerName/join$stateVersion/"
     ).toURI
 
     val resourceDir = new File(resourceUri)
@@ -1196,5 +1461,43 @@ abstract class StateDataSourceReadSuite extends StateDataSourceTestBase with Ass
       .filter(col("partition_id") === 2)
 
     checkAnswer(stateSnapshotDf, stateDf)
+  }
+
+  protected def testSnapshotOnJoinStateV3(): Unit = {
+    withTempDir { tmpDir =>
+      withSQLConf(
+        SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key -> "3",
+        SQLConf.STREAMING_MAINTENANCE_INTERVAL.key -> "100"
+      ) {
+        val inputData = MemoryStream[(Int, Long)]
+        val query = getStreamStreamJoinQuery(inputData)
+        testStream(query)(
+          StartStream(checkpointLocation = tmpDir.getCanonicalPath),
+          AddData(inputData, (1, 1L), (2, 2L), (3, 3L), (4, 4L), (5, 5L)),
+          ProcessAllAvailable(),
+          Execute { _ => Thread.sleep(2000) },
+          AddData(inputData, (6, 6L), (7, 7L), (8, 8L), (9, 9L), (10, 10L)),
+          ProcessAllAvailable(),
+          Execute { _ => Thread.sleep(2000) },
+          AddData(inputData, (11, 11L), (12, 12L), (13, 13L), (14, 14L), (15, 15L)),
+          ProcessAllAvailable(),
+          Execute { _ => Thread.sleep(5000) },
+          StopStream
+        )
+
+        val stateSnapshotDf = spark.read.format("statestore")
+          .option("snapshotPartitionId", 2)
+          .option("snapshotStartBatchId", 0)
+          .option("joinSide", "left")
+          .load(tmpDir.getCanonicalPath)
+
+        val stateDf = spark.read.format("statestore")
+          .option("joinSide", "left")
+          .load(tmpDir.getCanonicalPath)
+          .filter(col("partition_id") === 2)
+
+        checkAnswer(stateSnapshotDf, stateDf)
+      }
+    }
   }
 }
